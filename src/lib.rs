@@ -2,6 +2,7 @@ pub mod appointments;
 pub mod audio;
 pub mod cascade;
 pub mod cascade_http;
+pub mod coach;
 pub mod common;
 pub mod notify;
 pub mod outbound;

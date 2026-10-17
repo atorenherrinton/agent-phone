@@ -53,6 +53,12 @@ const CONNECT_NUDGE: &str =
 const INTERRUPTED_MARKER: &str = "[interrupted by the caller]";
 const UNHEARD_MARKER: &str = "[interrupted before the caller heard any of it]";
 const UNAVAILABLE_TRANSCRIPT: &str = "[Caller speech transcription unavailable]";
+const COACH_NUDGE: &str = "(The owner just sent you private coaching. Act on it now.)";
+const HANDBACK_NUDGE: &str =
+    "(The owner has handed the call back to you. Continue from where things stand.)";
+const COACH_HEADER: &str = "Owner coaching notes (trusted, from the owner on a private line; the other party never heard the coaching). Follow the latest coaching, never read it aloud verbatim, and never say you are being coached:";
+const MAX_OWNER_NOTES: usize = 24;
+const MAX_OWNER_NOTE_BYTES: usize = 6 * 1024;
 
 /// Stage failures carry no detail: provider replies can contain private text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +165,8 @@ pub(crate) enum Effect {
     Transcribe(Vec<u8>),
     StartTurn(TurnRequest),
     AbortTurn,
+    /// Audio for the owner's coach leg; dropped when it cannot keep up.
+    Owner(crate::coach::ToOwner),
 }
 
 struct Utterance {
@@ -235,6 +243,12 @@ pub(crate) struct Core {
     ending: bool,
     draining: bool,
     started: bool,
+    /// The owner's coach leg is connected and hearing the call.
+    owner_present: bool,
+    /// The owner is speaking to the other party directly; the assistant is silent.
+    takeover: bool,
+    coach_pending: bool,
+    owner_notes: VecDeque<String>,
 }
 
 fn decode_media(encoded: &str) -> BridgeResult<Vec<u8>> {
@@ -277,7 +291,19 @@ impl Core {
             ending: false,
             draining: false,
             started: false,
+            owner_present: false,
+            takeover: false,
+            coach_pending: false,
+            owner_notes: VecDeque::new(),
         }
+    }
+
+    fn system_prompt(&self) -> String {
+        if self.owner_notes.is_empty() {
+            return self.instructions.clone();
+        }
+        let notes = json!(self.owner_notes);
+        format!("{}\n\n{COACH_HEADER}\n{notes}", self.instructions)
     }
 
     pub(crate) fn start(&mut self, value: &Value, options: &CascadeOptions) -> BridgeResult<()> {
@@ -313,7 +339,7 @@ impl Core {
         let (messages, tools) = if confirmation {
             let mut messages = self.history.clone();
             messages[0] = json!({"role":"system","content":format!(
-                "{}\n\nRuntime close protocol: {END_CONFIRM_INSTRUCTIONS}", self.instructions
+                "{}\n\nRuntime close protocol: {END_CONFIRM_INSTRUCTIONS}", self.system_prompt()
             )});
             (messages, json!([]))
         } else {
@@ -337,6 +363,7 @@ impl Core {
             || self.stt_inflight
             || !self.stt_queue.is_empty()
             || self.turn.is_some()
+            || self.takeover
             || !self.unanswered()
         {
             return Ok(Vec::new());
@@ -366,7 +393,11 @@ impl Core {
         self.items[index].done = true;
         self.set_text(index, text)?;
         match self.history.last_mut() {
-            Some(last) if last["role"] == "user" && last["content"] == CONNECT_NUDGE => {
+            Some(last)
+                if last["role"] == "user"
+                    && [CONNECT_NUDGE, COACH_NUDGE, HANDBACK_NUDGE]
+                        .contains(&last["content"].as_str().unwrap_or_default()) =>
+            {
                 last["content"] = json!(text);
             }
             Some(last) if last["role"] == "user" => {
@@ -476,6 +507,9 @@ impl Core {
             effects.push(Effect::Twilio(
                 json!({"event":"clear","streamSid":self.stream_sid}),
             ));
+            if self.owner_present {
+                effects.push(Effect::Owner(crate::coach::ToOwner::ClearAssistant));
+            }
         }
         let aborted_index = aborted.map(|turn| turn.item_index);
         for index in 0..self.items.len() {
@@ -559,6 +593,9 @@ impl Core {
                     return Err(EndReason::ResourceLimit);
                 }
                 let mut effects = Vec::new();
+                if self.owner_present {
+                    effects.push(Effect::Owner(crate::coach::ToOwner::Callee(bytes.clone())));
+                }
                 for event in self.vad.push(&bytes) {
                     match event {
                         EndpointEvent::SpeechStarted => effects.extend(self.speech_started()),
@@ -615,6 +652,9 @@ impl Core {
         self.queued_output_bytes += mulaw.len();
         self.total_output_bytes += mulaw.len();
         let mut effects = Vec::new();
+        if self.owner_present {
+            effects.push(Effect::Owner(crate::coach::ToOwner::Assistant(mulaw.clone())));
+        }
         for chunk in mulaw.chunks(PLAYBACK_CHUNK) {
             self.items[index].sent_bytes += chunk.len();
             self.next_mark += 1;
@@ -697,7 +737,104 @@ impl Core {
             }
         }
         self.ended_if_finished()?;
+        effects.extend(self.coach_followup()?);
         Ok(effects)
+    }
+
+    /// Answer pending owner coaching once the assistant is free to speak.
+    fn coach_followup(&mut self) -> BridgeResult<Vec<Effect>> {
+        if !self.coach_pending
+            || self.takeover
+            || self.ending
+            || self.turn.is_some()
+            || self.close_phase != ClosePhase::Open
+        {
+            return Ok(Vec::new());
+        }
+        self.coach_pending = false;
+        if !self.unanswered() {
+            self.history.push(json!({"role":"user","content":COACH_NUDGE}));
+        }
+        self.maybe_start_turn()
+    }
+
+    fn add_owner_note(&mut self, note: String) {
+        self.owner_notes.push_back(note);
+        let mut bytes: usize = self.owner_notes.iter().map(String::len).sum();
+        while self.owner_notes.len() > MAX_OWNER_NOTES
+            || (bytes > MAX_OWNER_NOTE_BYTES && self.owner_notes.len() > 1)
+        {
+            bytes -= self.owner_notes.pop_front().map_or(0, |n| n.len());
+        }
+        self.history[0] = json!({"role":"system","content":self.system_prompt()});
+    }
+
+    /// One event from the owner's coach leg.
+    pub(crate) fn owner(&mut self, event: crate::coach::FromOwner) -> BridgeResult<Vec<Effect>> {
+        use crate::coach::FromOwner;
+        match event {
+            FromOwner::Joined => {
+                self.owner_present = true;
+                Ok(Vec::new())
+            }
+            FromOwner::Speech(text) => {
+                let text: String = text.chars().filter(|c| !c.is_control()).take(1000).collect();
+                let text = text.trim();
+                if text.is_empty() || !self.started || self.items.len() >= MAX_ITEMS {
+                    return Ok(Vec::new());
+                }
+                self.items.push(Utterance::new("owner"));
+                let index = self.items.len() - 1;
+                self.items[index].done = true;
+                self.set_text(index, text)?;
+                if self.takeover {
+                    self.add_owner_note(format!("The owner said directly to the other party: {text}"));
+                    Ok(Vec::new())
+                } else {
+                    self.add_owner_note(format!("Coaching: {text}"));
+                    self.coach_pending = true;
+                    self.coach_followup()
+                }
+            }
+            FromOwner::Audio(bytes) => {
+                if !self.takeover || bytes.is_empty() || bytes.len() > MAX_MEDIA_PAYLOAD {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![Effect::Twilio(json!({
+                    "event":"media","streamSid":self.stream_sid,
+                    "media":{"payload":STANDARD.encode(bytes)}
+                }))])
+            }
+            FromOwner::TakeOver => {
+                if self.takeover {
+                    return Ok(Vec::new());
+                }
+                self.takeover = true;
+                self.coach_pending = false;
+                self.ending = false;
+                self.close_phase = ClosePhase::Open;
+                self.close_deadline = None;
+                Ok(self.interrupt())
+            }
+            FromOwner::HandBack => self.hand_back(),
+        }
+    }
+
+    fn hand_back(&mut self) -> BridgeResult<Vec<Effect>> {
+        if !self.takeover {
+            return Ok(Vec::new());
+        }
+        self.takeover = false;
+        if !self.unanswered() {
+            self.history.push(json!({"role":"user","content":HANDBACK_NUDGE}));
+        }
+        self.maybe_start_turn()
+    }
+
+    /// The coach leg hung up: stop forwarding and give the call back to the AI.
+    pub(crate) fn owner_left(&mut self) -> BridgeResult<Vec<Effect>> {
+        self.owner_present = false;
+        self.hand_back()
     }
 
     pub(crate) fn outcome(self, reason: EndReason, duration_ms: u64) -> BridgeOutcome {
@@ -876,6 +1013,15 @@ async fn next_turn_event(turn: &mut Option<TurnTask>) -> Option<TurnEvent> {
     }
 }
 
+async fn next_owner_event(
+    coach: &mut Option<crate::coach::MainLink>,
+) -> Option<crate::coach::FromOwner> {
+    match coach {
+        Some(link) => link.from_owner.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn spawn_transcription(stages: &mut Stages, pipeline: &Arc<Pipeline>, audio: Vec<u8>) {
     let pipeline = pipeline.clone();
     stages.stt = Some(Task(tokio::spawn(async move {
@@ -887,6 +1033,7 @@ async fn execute(
     twilio: &mut WebSocket,
     stages: &mut Stages,
     pipeline: &Arc<Pipeline>,
+    coach: &Option<crate::coach::MainLink>,
     effects: Vec<Effect>,
     deadline: Instant,
 ) -> BridgeResult<()> {
@@ -911,6 +1058,11 @@ async fn execute(
                 });
             }
             Effect::AbortTurn => stages.turn = None,
+            Effect::Owner(message) => {
+                if let Some(link) = coach {
+                    let _ = link.to_owner.try_send(message);
+                }
+            }
         }
     }
     Ok(())
@@ -922,6 +1074,7 @@ async fn run_bridge(
     core: &mut Core,
     stages: &mut Stages,
     pipeline: &Arc<Pipeline>,
+    coach: &mut Option<crate::coach::MainLink>,
     deadline: Instant,
 ) -> BridgeResult<()> {
     let setup_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
@@ -938,7 +1091,7 @@ async fn run_bridge(
     };
     core.start(&start, options)?;
     let effects = core.begin()?;
-    execute(twilio, stages, pipeline, effects, setup_deadline).await?;
+    execute(twilio, stages, pipeline, coach, effects, setup_deadline).await?;
     loop {
         let close_timeout = core.close_timeout();
         let current_deadline = close_timeout
@@ -963,8 +1116,15 @@ async fn run_bridge(
                 // The turn task ended without a final event.
                 None => return Err(EndReason::UpstreamError),
             },
+            event = next_owner_event(coach) => match event {
+                Some(event) => core.owner(event)?,
+                None => {
+                    *coach = None;
+                    core.owner_left()?
+                }
+            },
         };
-        execute(twilio, stages, pipeline, effects, current_deadline).await?;
+        execute(twilio, stages, pipeline, coach, effects, current_deadline).await?;
     }
 }
 
@@ -1004,9 +1164,20 @@ async fn drain_transcripts(
 /// Bridge one already-authorized call. The hard cap can be shortened, not raised.
 /// Outcomes contain private transcripts and should only be persisted privately.
 pub async fn bridge(
+    socket: WebSocket,
+    options: CascadeOptions,
+    pipeline: Arc<Pipeline>,
+) -> BridgeOutcome {
+    coached_bridge(socket, options, pipeline, None).await
+}
+
+/// `bridge` with an optional owner coach leg. Dropping the link when the call
+/// ends closes the owner leg too.
+pub async fn coached_bridge(
     mut socket: WebSocket,
     options: CascadeOptions,
     pipeline: Arc<Pipeline>,
+    mut coach: Option<crate::coach::MainLink>,
 ) -> BridgeOutcome {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(options.max_duration_secs.min(MAX_SECONDS));
@@ -1025,6 +1196,7 @@ pub async fn bridge(
             &mut core,
             &mut stages,
             &pipeline,
+            &mut coach,
             deadline,
         )
         .await
@@ -1045,6 +1217,7 @@ pub async fn bridge(
         reason = drain_reason;
     }
     drop(stages);
+    drop(coach);
     if reason == EndReason::RecordingDeclined {
         // Stop the carrier first and discard the whole call when building the outcome.
         let _ = timeout_at(

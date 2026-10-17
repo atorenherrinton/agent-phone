@@ -10,6 +10,11 @@ JSON CLI):
 - **Outbound AI calls.** An agent asks for a call with a bounded purpose; the
   phone AI places it, discloses that it is an AI calling on your behalf, handles
   the conversation, and reports the outcome and transcript.
+- **Coach mode (3-way).** With `coach`, the service also rings your own number
+  (`forwarded_from`). You hear both sides live, anything you say is a private
+  note only the AI hears, **1** takes over the call (your voice goes straight to
+  the other party, the AI goes quiet) and **2** hands it back. Hanging up
+  returns the call to the AI. Requires the cascade voice engine.
 
 Forked from `zeroclaw-phone` and made agent-agnostic: no ZeroClaw config,
 secret store, Discord, or calendar integration. It runs fully locally if you
@@ -66,7 +71,7 @@ MCP (stdio), e.g. Claude Code, Claude Desktop, nullclaw, or any MCP client:
 
 Tools: `place_call`, `call_status`, `list_calls`, `get_call`.
 
-CLI equivalents (JSON output): `agent-phone call --to +1... --purpose "..."`,
+CLI equivalents (JSON output): `agent-phone call --to +1... --purpose "..." [--coach]`,
 `status ID`, `calls`, `show CALL_SID`. Owner-only: `allow +1...` /
 `disallow +1...` edit the allowlist; don't expose them to agents.
 

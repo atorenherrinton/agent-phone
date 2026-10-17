@@ -1066,3 +1066,104 @@ async fn invalid_options_never_touch_the_stages() {
     assert!(outcome.transcript.is_empty());
     assert!(!outcome.model_session_ready);
 }
+
+fn owner_frames(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::Owner(_)))
+        .count()
+}
+
+#[test]
+fn coach_leg_hears_both_sides_only_after_joining() {
+    use crate::coach::FromOwner;
+    let o = options();
+    let (mut core, _) = started(&o);
+    let before = core.turn_event(speech("Hello.", 800)).unwrap();
+    assert_eq!(owner_frames(&before), 0);
+    core.owner(FromOwner::Joined).unwrap();
+    let assistant = core.turn_event(speech("Still there?", 800)).unwrap();
+    assert_eq!(owner_frames(&assistant), 1);
+    let callee = media(&mut core, &test_silence(1)).unwrap();
+    assert_eq!(owner_frames(&callee), 1);
+    let barge = talk(&mut core);
+    assert!(barge.iter().any(|e| matches!(
+        e,
+        Effect::Owner(crate::coach::ToOwner::ClearAssistant)
+    )));
+}
+
+#[test]
+fn owner_coaching_reaches_the_system_prompt_and_prompts_a_reply() {
+    use crate::coach::FromOwner;
+    let o = options();
+    let (mut core, _) = started(&o);
+    core.owner(FromOwner::Joined).unwrap();
+    // A reply is in flight: coaching waits for it instead of interrupting.
+    let waiting = core
+        .owner(FromOwner::Speech("Ask about Saturday.".into()))
+        .unwrap();
+    assert!(turn_request(&waiting).is_none());
+    let effects = core.turn_event(done("Hello.", None)).unwrap();
+    let request = turn_request(&effects).expect("coaching is acted on");
+    let system = request.messages[0]["content"].as_str().unwrap();
+    assert!(system.starts_with(INSTRUCTIONS));
+    assert!(system.contains("Coaching: Ask about Saturday."));
+    assert_eq!(request.messages.last().unwrap()["content"], COACH_NUDGE);
+    // The callee speaking first replaces the nudge instead of merging with it.
+    core.turn_event(done("Is Saturday possible?", None)).unwrap();
+    say(&mut core, "Saturday works.");
+    let outcome = core.outcome(EndReason::CallEnded, 1);
+    assert!(
+        outcome
+            .transcript
+            .iter()
+            .any(|e| e.speaker == "owner" && e.text == "Ask about Saturday.")
+    );
+}
+
+#[test]
+fn takeover_silences_the_assistant_and_passes_owner_audio_through() {
+    use crate::coach::FromOwner;
+    let o = options();
+    let (mut core, _) = started(&o);
+    core.owner(FromOwner::Joined).unwrap();
+    let playing = core.turn_event(speech("Hello.", 800)).unwrap();
+    assert!(!twilio_events(&playing, "mark").is_empty());
+    let taken = core.owner(FromOwner::TakeOver).unwrap();
+    assert!(has_abort(&taken));
+    assert_eq!(twilio_events(&taken, "clear").len(), 1);
+    let audio = core.owner(FromOwner::Audio(vec![0x7f; 160])).unwrap();
+    assert_eq!(twilio_events(&audio, "media").len(), 1);
+    // The callee is still transcribed, but the assistant does not answer.
+    let reply = say(&mut core, "Who is this?");
+    assert!(turn_request(&reply).is_none());
+    let direct = core
+        .owner(FromOwner::Speech("Hi, it's me.".into()))
+        .unwrap();
+    assert!(turn_request(&direct).is_none());
+    assert!(core.history[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("said directly to the other party: Hi, it's me."));
+    let back = core.owner(FromOwner::HandBack).unwrap();
+    assert!(turn_request(&back).is_some(), "the unanswered callee gets a reply");
+    assert!(core
+        .owner(FromOwner::Audio(vec![0x7f; 160]))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn owner_hanging_up_during_takeover_returns_the_call_to_the_assistant() {
+    use crate::coach::FromOwner;
+    let o = options();
+    let (mut core, _) = started(&o);
+    core.turn_event(done("Hello.", None)).unwrap();
+    core.owner(FromOwner::Joined).unwrap();
+    core.owner(FromOwner::TakeOver).unwrap();
+    let left = core.owner_left().unwrap();
+    let request = turn_request(&left).expect("assistant resumes");
+    assert_eq!(request.messages.last().unwrap()["content"], HANDBACK_NUDGE);
+    assert_eq!(owner_frames(&media(&mut core, &test_silence(1)).unwrap()), 0);
+}

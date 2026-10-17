@@ -364,7 +364,7 @@ fn model_input(job: &Job) -> SafeResult<String> {
     };
     for entry in entries {
         common::check(
-            matches!(entry.speaker.as_str(), "caller" | "assistant"),
+            matches!(entry.speaker.as_str(), "caller" | "assistant" | "owner"),
             "summary_speaker_invalid",
         )?;
         common::check(
@@ -462,7 +462,7 @@ fn plain_summary(job: &Job) -> SafeResult<String> {
     for entry in entries {
         let line = format!(
             "{}: {}\n",
-            if entry.speaker == "assistant" { "AI" } else { "Them" },
+            match entry.speaker.as_str() { "assistant" => "AI", "owner" => "You", _ => "Them" },
             neutralize(&entry.text).split_whitespace().collect::<Vec<_>>().join(" ")
         );
         if text.chars().count() + line.chars().count() > 3800 {

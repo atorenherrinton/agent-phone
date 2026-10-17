@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 use agent_phone::{
-    cascade, cascade_http,
+    cascade, cascade_http, coach,
     common::{self, RecordingConsentMode, SafeResult, Settings, VoiceEngine, check},
     outbound,
     protocol::{self, Form},
@@ -22,6 +22,8 @@ use agent_phone::{
 struct App {
     root: PathBuf,
     slots: Arc<tokio::sync::Semaphore>,
+    coach_slots: Arc<tokio::sync::Semaphore>,
+    coaches: coach::Registry,
 }
 
 type ExistingCall = (String, String, Option<String>, Option<bool>, i64);
@@ -458,10 +460,95 @@ async fn outbound_status(
         outbound::update_status(&app.root, &nonce, &cfg, &form)
     })();
     if result.is_ok() {
+        // An unanswered or finished AI call must not leave the owner's phone
+        // ringing or connected to nothing.
+        if let Some(request_id) = outbound::finished_request(&app.root, &nonce) {
+            app.coaches.forget(&request_id);
+            let root = app.root.clone();
+            tokio::spawn(async move { outbound::end_coach(&root, &request_id).await });
+        }
         xml(protocol::EMPTY)
     } else {
         fail()
     }
+}
+
+async fn coach_answer(
+    State(app): State<Arc<App>>,
+    AxumPath(nonce): AxumPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    let result = (|| -> SafeResult<String> {
+        let cfg = common::load(&app.root)?;
+        check(cfg.enabled, "phone_disabled")?;
+        let form = authenticate(&cfg, &uri, &headers, &bytes)?;
+        outbound::coach_answer(&app.root, &nonce, &cfg, &form)
+    })();
+    match result {
+        Ok(value) => xml(value),
+        Err(_) => fail(),
+    }
+}
+
+async fn coach_media(
+    State(app): State<Arc<App>>,
+    AxumPath(nonce): AxumPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let result = (|| -> SafeResult<_> {
+        let cfg = common::load(&app.root)?;
+        check(cfg.enabled, "phone_disabled")?;
+        let sig = headers
+            .get("x-twilio-signature")
+            .and_then(|v| v.to_str().ok())
+            .ok_or("signature_missing")?;
+        let url = format!(
+            "{}{}",
+            cfg.public_base,
+            uri.path_and_query().ok_or("invalid_uri")?
+        );
+        check(
+            protocol::websocket_signature_ok(&cfg.auth_token, &url, sig),
+            "signature_invalid",
+        )?;
+        let pipeline = cfg
+            .voice
+            .cascade
+            .as_ref()
+            .ok_or("cascade_config_missing")
+            .and_then(|config| cascade_http::build_pipeline(config, &cfg.api_key))?;
+        let permit = app
+            .coach_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "coach_capacity_exceeded")?;
+        let leg = outbound::coach_admit(&app.root, &nonce, &cfg)?;
+        Ok((cfg.account_sid, leg, pipeline.stt, permit))
+    })();
+    let Ok((account_sid, leg, stt, permit)) = result else {
+        return fail();
+    };
+    let link = app.coaches.owner(&leg.request_id);
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            coach::owner_bridge(
+                socket,
+                coach::OwnerOptions {
+                    expected_account_sid: account_sid,
+                    expected_call_sid: leg.call_sid,
+                    max_duration_secs: leg.remaining_secs,
+                },
+                link,
+                stt,
+            )
+            .await;
+        })
 }
 
 async fn media(
@@ -541,6 +628,10 @@ async fn media(
         }
     };
     let stop_on_recording_decline = outbound_task.is_none() && consented;
+    let coached = outbound_task
+        .as_ref()
+        .filter(|task| task.coach)
+        .map(|task| task.request_id.clone());
     let (instructions, allow_end_call, confirm_end_call) = if let Some(task) = outbound_task {
         let confirm = outbound::confirm_end_call(&task);
         (outbound::instructions(&task), true, confirm)
@@ -596,6 +687,9 @@ async fn media(
                     stop_on_recording_decline,
                 },
                 Arc::new(pipeline),
+                coached
+                    .as_deref()
+                    .and_then(|request_id| app.coaches.main(request_id)),
             )
         }
     };
@@ -609,16 +703,26 @@ async fn media(
         let _permit=permit;
         let outcome = match bridge {
             Bridge::Realtime(opts) => realtime::bridge(socket, opts).await,
-            Bridge::Cascade(opts, pipeline) => cascade::bridge(socket, opts, pipeline).await,
+            Bridge::Cascade(opts, pipeline, link) => {
+                cascade::coached_bridge(socket, opts, pipeline, link).await
+            }
         };
         if let Err(error)=finish_call(&app.root,&sid,first_entries,outcome) { eprintln!("{error}"); }
+        if let Some(request_id) = coached {
+            app.coaches.forget(&request_id);
+            outbound::end_coach(&app.root, &request_id).await;
+        }
     })
 }
 
 /// The engine admitted for one call. Both produce the same `BridgeOutcome`.
 enum Bridge {
     Realtime(realtime::RealtimeOptions),
-    Cascade(cascade::CascadeOptions, Arc<cascade::Pipeline>),
+    Cascade(
+        cascade::CascadeOptions,
+        Arc<cascade::Pipeline>,
+        Option<coach::MainLink>,
+    ),
 }
 
 fn finish_call(
@@ -688,6 +792,8 @@ async fn serve(root: PathBuf) -> SafeResult<()> {
     let app = Arc::new(App {
         root: root.clone(),
         slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        coach_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        coaches: coach::Registry::default(),
     });
     let router = phone_router(app);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, cfg.port))
@@ -724,6 +830,8 @@ fn phone_router(app: Arc<App>) -> Router {
         .route("/voice/recording", post(recording_callback))
         .route("/voice/outbound/{nonce}", post(outbound_answer))
         .route("/voice/outbound-status/{nonce}", post(outbound_status))
+        .route("/voice/coach/{nonce}", post(coach_answer))
+        .route("/voice/coach-media/{nonce}", get(coach_media))
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(axum::middleware::from_fn_with_state(ingress, bound_request))
         .with_state(app)
@@ -879,7 +987,7 @@ Service:
                              do not expose this command to agents)
 
 Agent commands (print JSON):
-  call --to +1... --purpose TEXT [--recipient NAME] [--on-behalf-of NAME]
+  call --to +1... --purpose TEXT [--recipient NAME] [--on-behalf-of NAME] [--coach]
   status REQUEST_ID
   calls [--limit N] [--direction inbound|outbound]
   show CALL_SID
@@ -1023,23 +1131,28 @@ async fn run() {
             }
             _ => Err("usage_set_secret_name"),
         },
-        "call" => match flags(rest, &["to", "purpose", "recipient", "on-behalf-of"]) {
-            Ok(mut f) => match (f.remove("to"), f.remove("purpose")) {
-                (Some(to), Some(purpose)) => outbound::place(
-                    &root,
-                    outbound::PlaceArgs {
-                        to,
-                        purpose,
-                        recipient: f.remove("recipient").unwrap_or_default(),
-                        on_behalf_of: f.remove("on-behalf-of").unwrap_or_default(),
-                    },
-                )
-                .await
-                .map(print_json),
-                _ => Err("usage_call_to_purpose"),
-            },
-            Err(e) => Err(e),
-        },
+        "call" => {
+            let coach = rest.iter().any(|arg| arg == "--coach");
+            let rest: Vec<String> = rest.iter().filter(|arg| *arg != "--coach").cloned().collect();
+            match flags(&rest, &["to", "purpose", "recipient", "on-behalf-of"]) {
+                Ok(mut f) => match (f.remove("to"), f.remove("purpose")) {
+                    (Some(to), Some(purpose)) => outbound::place(
+                        &root,
+                        outbound::PlaceArgs {
+                            to,
+                            purpose,
+                            recipient: f.remove("recipient").unwrap_or_default(),
+                            on_behalf_of: f.remove("on-behalf-of").unwrap_or_default(),
+                            coach,
+                        },
+                    )
+                    .await
+                    .map(print_json),
+                    _ => Err("usage_call_to_purpose"),
+                },
+                Err(e) => Err(e),
+            }
+        }
         "status" => match rest {
             [id] => outbound::status(&root, id).map(print_json),
             _ => Err("usage_status_request_id"),
@@ -1661,6 +1774,8 @@ mod tests {
         let app = Arc::new(App {
             root: fixture.root.clone(),
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            coach_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            coaches: coach::Registry::default(),
         });
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2075,6 +2190,8 @@ mod tests {
             let app = Arc::new(App {
                 root: fixture.root.clone(),
                 slots: Arc::new(tokio::sync::Semaphore::new(1)),
+                coach_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+                coaches: coach::Registry::default(),
             });
             let mut form = valid_form();
             form.insert("RecordingSid".into(), RECORDING.into());
