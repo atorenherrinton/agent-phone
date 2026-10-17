@@ -1,0 +1,35 @@
+# ~/.agent-phone/phone.toml  (chmod 600). Secrets go in ~/.agent-phone/secrets/.
+enabled = true
+port = 43335
+public_base = "https://your-host.your-tailnet.ts.net/"   # public HTTPS URL that reaches port
+account_sid = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+from_number = "+12065550100"        # your Twilio number
+# forwarded_from = "+14085550100"   # your cell, if it forwards unanswered calls here
+# caller_id = "+14085550100"        # show a Twilio-verified number on outbound calls
+allowed_destinations = []           # outbound allowlist; omit to allow any number
+max_duration_secs = 300
+recording_consent = "notice"        # or "explicit" (keypad opt-in)
+owner_name = "Alex"
+
+[notify]                             # optional; JSON event on stdin, no shell
+command = ["/usr/local/bin/agent-phone-telegram"]
+timeout_secs = 120
+
+[summary]                            # optional; any OpenAI-compatible endpoint
+url = "http://127.0.0.1:11434/v1/chat/completions"
+model = "qwen3"
+extra = { reasoning_effort = "none" }
+# api_key_secret = "summary_api_key"   # reads secrets/summary_api_key
+
+[voice]
+engine = "cascade"                   # or "realtime" (needs secrets/openai_api_key)
+
+[voice.cascade]
+stt_url = "http://127.0.0.1:8178/v1/audio/transcriptions"
+stt_language = "en"
+llm_url = "http://127.0.0.1:11434/v1/chat/completions"
+llm_model = "qwen3"
+llm_extra = { reasoning_effort = "none" }
+tts = "say"                          # macOS say; or "http" with tts_url
+tts_voice = "Fred"
+tts_rate = 190

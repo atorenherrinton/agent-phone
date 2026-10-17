@@ -1,0 +1,37 @@
+[package]
+name = "agent-phone"
+description = "Phone calls for AI agents: Twilio voicemail screening and outbound AI calls over MCP"
+license = "MIT"
+repository = "https://github.com/atorenherrinton/agent-phone"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs", "process", "io-util", "io-std"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.0"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+base64 = "0.22"
+ring = "0.17"
+sha2 = "0.10"
+uuid = { version = "1.22", features = ["v4", "std"] }
+libc = "0.2"
+tempfile = "3.26"
+url = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+[workspace]
