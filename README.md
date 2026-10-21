@@ -42,21 +42,26 @@ agent writes into `purpose` may be spoken**.
 
 ```sh
 cargo build --release
-install -m 755 target/release/agent-phone ~/.local/bin/
+rm -f ~/.local/bin/agent-phone && cp target/release/agent-phone ~/.local/bin/   # a fresh file: overwriting a running binary in place breaks its code signature on macOS
 mkdir -p ~/.agent-phone && chmod 700 ~/.agent-phone
 cp examples/phone.toml examples/screening.md ~/.agent-phone/ && chmod 600 ~/.agent-phone/*
 printf %s "$TWILIO_AUTH_TOKEN" | agent-phone set-secret twilio_auth_token
 agent-phone check          # {"configValid":true}
 agent-phone probe          # exercises STT, LLM and TTS once
-agent-phone serve          # webhook server on 127.0.0.1:<port>
+agent-phone serve          # webhook server on 127.0.0.1:<port> and <root>/serve.sock
 ```
 
-Expose the port over HTTPS (Tailscale Funnel, Cloudflare Tunnel, ngrok...) and
+Expose the server over HTTPS (Tailscale Funnel, Cloudflare Tunnel, ngrok...) and
 point the Twilio number's voice webhook at `https://<public>/voice/webhook`
-(POST):
+(POST). With a userspace `tailscaled`, proxy to the unix socket rather than the
+port: tailscaled drops its TCP connections to localhost on every network link
+change, which Twilio sees as a 502 and the caller as a busy signal.
 
 ```sh
-twilio phone-numbers:update +12065550100 --voice-url https://<public>/voice/webhook --voice-method POST
+tailscale funnel --bg unix:$HOME/.agent-phone/serve.sock
+twilio phone-numbers:update +12065550100 --voice-url https://<public>/voice/webhook --voice-method POST \
+  --voice-fallback-url https://<public>/voice/webhook --voice-fallback-method POST \
+  --status-callback "https://<public>/voice/webhook?type=status" --status-callback-method POST
 agent-phone route-check    # public health + unsigned requests rejected
 agent-phone preflight      # Twilio number points at this service
 ```

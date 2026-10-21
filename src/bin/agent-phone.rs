@@ -791,6 +791,24 @@ fn inbound_instructions(
     instructions
 }
 
+/// Tunnel ingress. A userspace tailscaled closes its TCP connections to
+/// 127.0.0.1 on every major link change (e.g. a Thunderbolt bridge flapping),
+/// failing webhooks with 502; its unix-socket backends are not affected.
+const SOCKET_NAME: &str = "serve.sock";
+
+fn bind_socket(path: &Path) -> SafeResult<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    // Replace only a stale socket from a previous run, never another file.
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        check(m.file_type().is_socket(), "socket_path_occupied")?;
+        std::fs::remove_file(path).map_err(|_| "socket_cleanup_failed")?;
+    }
+    let listener = tokio::net::UnixListener::bind(path).map_err(|_| "socket_bind_failed")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| "socket_permissions_failed")?;
+    Ok(listener)
+}
+
 async fn serve(root: PathBuf) -> SafeResult<()> {
     let cfg = common::load(&root)?;
     common::private_dir(&root.join("transcripts"))?;
@@ -808,15 +826,21 @@ async fn serve(root: PathBuf) -> SafeResult<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, cfg.port))
         .await
         .map_err(|_| "listener_bind_failed")?;
+    let socket = bind_socket(&root.join(SOCKET_NAME))?;
     // A successfully bound sole listener owns recovery. Never let an expired
     // socket claim survive restart or prevent the next legitimate call.
     db.execute("UPDATE calls SET phase='ended',outcome='service_interrupted',summary_status=CASE WHEN transcript IS NULL THEN 'needs_review' ELSE summary_status END WHERE phase='active'",[]).map_err(|_|"call_recovery_failed")?;
     let recordings_root = root.clone();
     let worker = tokio::spawn(async move { recording::run(recordings_root).await });
-    eprintln!("agent-phone listening on 127.0.0.1:{}", cfg.port);
+    eprintln!(
+        "agent-phone listening on 127.0.0.1:{} and {}",
+        cfg.port,
+        root.join(SOCKET_NAME).display()
+    );
     let summaries = tokio::spawn(async move { summary::run(root).await });
     tokio::select! {
-        result = axum::serve(listener,router).with_graceful_shutdown(shutdown_signal()).into_future() => result.map_err(|_|"listener_failed"),
+        result = axum::serve(listener,router.clone()).with_graceful_shutdown(shutdown_signal()).into_future() => result.map_err(|_|"listener_failed"),
+        result = axum::serve(socket,router).with_graceful_shutdown(shutdown_signal()).into_future() => result.map_err(|_|"socket_listener_failed"),
         result = worker => match result { Ok(Err(error))=>Err(error), _=>Err("recording_worker_stopped") },
         result = summaries => match result { Ok(Err(error))=>Err(error), _=>Err("summary_worker_stopped") }
     }
@@ -903,6 +927,19 @@ async fn preflight(root: &Path) -> SafeResult<()> {
         row["voice_url"] == format!("{}/voice/webhook", cfg.public_base)
             && row["voice_method"] == "POST",
         "phone_webhook_route_mismatch",
+    )?;
+    // A stale callback (e.g. an old tunnel) silently leaves calls unended, and
+    // a foreign fallback would hand callers elsewhere when the tunnel blips.
+    let unset = |key: &str| row.get(key).is_none_or(|v| v.is_null() || v == "");
+    check(
+        unset("status_callback")
+            || row["status_callback"] == format!("{}/voice/webhook?type=status", cfg.public_base),
+        "phone_status_callback_mismatch",
+    )?;
+    check(
+        unset("voice_fallback_url")
+            || row["voice_fallback_url"] == format!("{}/voice/webhook", cfg.public_base),
+        "phone_fallback_route_mismatch",
     )?;
     for key in ["voice_application_sid", "trunk_sid"] {
         check(
@@ -1543,6 +1580,25 @@ mod tests {
             .unwrap();
         assert_eq!(state, ("consent".into(), None, None));
         assert_eq!(fixture.recording_count(), 0);
+    }
+
+    #[test]
+    fn socket_bind_replaces_only_stale_sockets() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join(SOCKET_NAME);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            drop(bind_socket(&path).unwrap());
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            drop(bind_socket(&path).unwrap());
+        });
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"not a socket").unwrap();
+        assert_eq!(bind_socket(&path).err(), Some("socket_path_occupied"));
+        assert_eq!(fs::read(&path).unwrap(), b"not a socket");
     }
 
     #[test]
