@@ -42,7 +42,8 @@ agent writes into `purpose` may be spoken**.
 
 ```sh
 cargo build --release
-rm -f ~/.local/bin/agent-phone && cp target/release/agent-phone ~/.local/bin/   # a fresh file: overwriting a running binary in place breaks its code signature on macOS
+rm -f ~/.local/bin/agent-phone && cp target/release/agent-phone ~/.local/bin/
+codesign -f -s - ~/.local/bin/agent-phone   # macOS: a reinstalled linker-signed binary can fail launchd's signature check
 mkdir -p ~/.agent-phone && chmod 700 ~/.agent-phone
 cp examples/phone.toml examples/screening.md ~/.agent-phone/ && chmod 600 ~/.agent-phone/*
 printf %s "$TWILIO_AUTH_TOKEN" | agent-phone set-secret twilio_auth_token
@@ -58,7 +59,7 @@ port: tailscaled drops its TCP connections to localhost on every network link
 change, which Twilio sees as a 502 and the caller as a busy signal.
 
 ```sh
-tailscale funnel --bg unix:$HOME/.agent-phone/serve.sock
+sudo tailscale funnel --bg unix:$HOME/.agent-phone/serve.sock   # unix backends require root
 twilio phone-numbers:update +12065550100 --voice-url https://<public>/voice/webhook --voice-method POST \
   --voice-fallback-url https://<public>/voice/webhook --voice-fallback-method POST \
   --status-callback "https://<public>/voice/webhook?type=status" --status-callback-method POST
