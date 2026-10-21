@@ -83,6 +83,11 @@ fn xml(body: impl Into<String>) -> Response {
 fn fail() -> Response {
     (StatusCode::FORBIDDEN, "Rejected").into_response()
 }
+/// Log the stable error code (never form contents) so a dropped call is diagnosable.
+fn reject(route: &str, code: &str) -> Response {
+    eprintln!("{route}_rejected: {code}");
+    fail()
+}
 
 fn authenticate(cfg: &Settings, uri: &Uri, headers: &HeaderMap, bytes: &[u8]) -> SafeResult<Form> {
     let form = protocol::parse_form(bytes)?;
@@ -142,7 +147,7 @@ async fn webhook(
             }
             xml(value)
         }
-        Err(_) => fail(),
+        Err(code) => reject("webhook", code),
     }
 }
 
@@ -199,6 +204,12 @@ fn initial(root: &Path, uri: &Uri, headers: &HeaderMap, bytes: &[u8]) -> SafeRes
         .filter(|v| common::e164(v))
         .cloned()
         .unwrap_or_default();
+    // An outbound call to the owner that rolls to voicemail is forwarded back
+    // here; answering it would make the phone call itself and file a phantom
+    // voicemail, so the loop is turned away before any call state exists.
+    if from == cfg.from_number {
+        return Ok(protocol::REJECT.into());
+    }
     tx.execute(
         "UPDATE calls SET phase='expired' WHERE phase NOT IN ('ended','expired') AND created_ms<?",
         [now - 180_000],
@@ -237,7 +248,7 @@ async fn consent(
 ) -> Response {
     match consent_result(&app.root, &nonce, &uri, &headers, &bytes) {
         Ok(v) => xml(v),
-        Err(_) => fail(),
+        Err(code) => reject("consent", code),
     }
 }
 
@@ -291,7 +302,7 @@ async fn notice(
 ) -> Response {
     match notice_result(&app.root, &nonce, &uri, &headers, &bytes) {
         Ok(value) => xml(value),
-        Err(_) => fail(),
+        Err(code) => reject("notice", code),
     }
 }
 
@@ -421,10 +432,9 @@ async fn recording_callback(
             protocol::one(&f, "RecordingStatus")?,
         )
     })();
-    if result.is_ok() {
-        xml(protocol::EMPTY)
-    } else {
-        fail()
+    match result {
+        Ok(()) => xml(protocol::EMPTY),
+        Err(code) => reject("recording", code),
     }
 }
 
@@ -443,7 +453,7 @@ async fn outbound_answer(
     })();
     match result {
         Ok(value) => xml(value),
-        Err(_) => fail(),
+        Err(code) => reject("outbound_answer", code),
     }
 }
 
@@ -459,18 +469,17 @@ async fn outbound_status(
         let form = authenticate(&cfg, &uri, &headers, &bytes)?;
         outbound::update_status(&app.root, &nonce, &cfg, &form)
     })();
-    if result.is_ok() {
-        // An unanswered or finished AI call must not leave the owner's phone
-        // ringing or connected to nothing.
-        if let Some(request_id) = outbound::finished_request(&app.root, &nonce) {
-            app.coaches.forget(&request_id);
-            let root = app.root.clone();
-            tokio::spawn(async move { outbound::end_coach(&root, &request_id).await });
-        }
-        xml(protocol::EMPTY)
-    } else {
-        fail()
+    if let Err(code) = result {
+        return reject("outbound_status", code);
     }
+    // An unanswered or finished AI call must not leave the owner's phone
+    // ringing or connected to nothing.
+    if let Some(request_id) = outbound::finished_request(&app.root, &nonce) {
+        app.coaches.forget(&request_id);
+        let root = app.root.clone();
+        tokio::spawn(async move { outbound::end_coach(&root, &request_id).await });
+    }
+    xml(protocol::EMPTY)
 }
 
 async fn coach_answer(
@@ -488,7 +497,7 @@ async fn coach_answer(
     })();
     match result {
         Ok(value) => xml(value),
-        Err(_) => fail(),
+        Err(code) => reject("coach_answer", code),
     }
 }
 
@@ -1534,6 +1543,19 @@ mod tests {
             .unwrap();
         assert_eq!(state, ("consent".into(), None, None));
         assert_eq!(fixture.recording_count(), 0);
+    }
+
+    #[test]
+    fn own_outbound_call_forwarded_back_is_rejected() {
+        let fixture = Fixture::new();
+        let mut form = valid_form();
+        form.insert("From".into(), TO.into());
+        assert_eq!(fixture.initial(&form).unwrap(), protocol::REJECT);
+        let calls: i64 = fixture
+            .db()
+            .query_row("SELECT count(*) FROM calls", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(calls, 0);
     }
 
     #[test]
