@@ -318,12 +318,21 @@ fn keep_download(root: &Path, settings: &Settings, job: &Job, bytes: &[u8]) -> S
         return finish(root, job, "failed", error);
     }
     // Without a hook the private archive is the whole delivery.
-    let state = if settings.notify.is_some() { "ready" } else { "stored" };
+    let state = if settings.notify.is_some() {
+        "ready"
+    } else {
+        "stored"
+    };
     let conn = common::open_db(root)?;
     conn.execute(
         "UPDATE recording_outbox SET state=?4,local_name=?2,last_error=NULL,
             updated_ms=?3,next_attempt_ms=?3 WHERE recording_sid=?1 AND state='downloading'",
-        params![job.recording_sid, name, Utc::now().timestamp_millis(), state],
+        params![
+            job.recording_sid,
+            name,
+            Utc::now().timestamp_millis(),
+            state
+        ],
     )
     .map_err(|_| "recording_archive_receipt_failed")?;
     Ok(())
@@ -341,7 +350,6 @@ async fn delete_remote(client: &Client, settings: &Settings, recording_sid: &str
         .send()
         .await
         .is_ok_and(|response| response.status().is_success())
-
     {
         eprintln!("recording_remote_delete_failed");
     }
@@ -719,7 +727,12 @@ mod tests {
         enqueue(&db, fixture::ACCOUNT, CALL, REC, "completed").unwrap();
         let settings = common::load(&root).unwrap();
         let job = claim_job(&root, &settings).unwrap().unwrap();
-        let mp3 = [b"ID3\x03\0\0\0\0\0\0".as_slice(), &[0xff, 0xfb, 0x90, 0x64], &[0; 64]].concat();
+        let mp3 = [
+            b"ID3\x03\0\0\0\0\0\0".as_slice(),
+            &[0xff, 0xfb, 0x90, 0x64],
+            &[0; 64],
+        ]
+        .concat();
         keep_download(&root, &settings, &job, &mp3).unwrap();
         assert_eq!(state(&db), "ready");
         let job = claim_job(&root, &settings).unwrap().unwrap();

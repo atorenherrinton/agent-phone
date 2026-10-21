@@ -82,7 +82,10 @@ mod tests {
     #[tokio::test]
     async fn failures_and_timeouts_are_distinguished() {
         assert_eq!(send(&hook("exit 3", 10), &json!({})).await, Outcome::Failed);
-        assert_eq!(send(&hook("sleep 5", 1), &json!({})).await, Outcome::Uncertain);
+        assert_eq!(
+            send(&hook("sleep 5", 1), &json!({})).await,
+            Outcome::Uncertain
+        );
         let missing = NotifyConfig {
             command: vec!["/nonexistent/hook".into()],
             timeout_secs: 5,

@@ -1087,10 +1087,11 @@ fn coach_leg_hears_both_sides_only_after_joining() {
     let callee = media(&mut core, &test_silence(1)).unwrap();
     assert_eq!(owner_frames(&callee), 1);
     let barge = talk(&mut core);
-    assert!(barge.iter().any(|e| matches!(
-        e,
-        Effect::Owner(crate::coach::ToOwner::ClearAssistant)
-    )));
+    assert!(
+        barge
+            .iter()
+            .any(|e| matches!(e, Effect::Owner(crate::coach::ToOwner::ClearAssistant)))
+    );
 }
 
 #[test]
@@ -1111,7 +1112,8 @@ fn owner_coaching_reaches_the_system_prompt_and_prompts_a_reply() {
     assert!(system.contains("Coaching: Ask about Saturday."));
     assert_eq!(request.messages.last().unwrap()["content"], COACH_NUDGE);
     // The callee speaking first replaces the nudge instead of merging with it.
-    core.turn_event(done("Is Saturday possible?", None)).unwrap();
+    core.turn_event(done("Is Saturday possible?", None))
+        .unwrap();
     say(&mut core, "Saturday works.");
     let outcome = core.outcome(EndReason::CallEnded, 1);
     assert!(
@@ -1142,16 +1144,22 @@ fn takeover_silences_the_assistant_and_passes_owner_audio_through() {
         .owner(FromOwner::Speech("Hi, it's me.".into()))
         .unwrap();
     assert!(turn_request(&direct).is_none());
-    assert!(core.history[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("said directly to the other party: Hi, it's me."));
+    assert!(
+        core.history[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("said directly to the other party: Hi, it's me.")
+    );
     let back = core.owner(FromOwner::HandBack).unwrap();
-    assert!(turn_request(&back).is_some(), "the unanswered callee gets a reply");
-    assert!(core
-        .owner(FromOwner::Audio(vec![0x7f; 160]))
-        .unwrap()
-        .is_empty());
+    assert!(
+        turn_request(&back).is_some(),
+        "the unanswered callee gets a reply"
+    );
+    assert!(
+        core.owner(FromOwner::Audio(vec![0x7f; 160]))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1165,5 +1173,8 @@ fn owner_hanging_up_during_takeover_returns_the_call_to_the_assistant() {
     let left = core.owner_left().unwrap();
     let request = turn_request(&left).expect("assistant resumes");
     assert_eq!(request.messages.last().unwrap()["content"], HANDBACK_NUDGE);
-    assert_eq!(owner_frames(&media(&mut core, &test_silence(1)).unwrap()), 0);
+    assert_eq!(
+        owner_frames(&media(&mut core, &test_silence(1)).unwrap()),
+        0
+    );
 }

@@ -54,7 +54,6 @@ struct OutboundSummaryFields {
     next_step: String,
 }
 
-
 // These structures intentionally do not implement Debug: all call content is private.
 struct Job {
     call_sid: String,
@@ -297,7 +296,11 @@ fn finish(root: &Path, job: &Job, state: &str, error: Option<&'static str>) -> S
 fn defer(root: &Path, job: &Job, stage: &str, error: &'static str) -> SafeResult<()> {
     let (column, count, max) = match stage {
         "model" => ("model_attempts", job.model_attempts + 1, MAX_MODEL_ATTEMPTS),
-        "notify" => ("notify_attempts", job.notify_attempts + 1, notify::MAX_ATTEMPTS),
+        "notify" => (
+            "notify_attempts",
+            job.notify_attempts + 1,
+            notify::MAX_ATTEMPTS,
+        ),
         _ => return Err("summary_stage_invalid"),
     };
     if count >= max {
@@ -407,9 +410,10 @@ async fn generate(
     job: &Job,
 ) -> SafeResult<String> {
     let input = model_input(job)?;
-    let mut request = client
-        .post(&config.url)
-        .json(&chat_body(config, system_prompt(job)?, &input));
+    let mut request =
+        client
+            .post(&config.url)
+            .json(&chat_body(config, system_prompt(job)?, &input));
     if let Some(name) = &config.api_key_secret {
         let key = common::read_secret(root, name)?.ok_or("summary_key_missing")?;
         request = request.bearer_auth(key);
@@ -417,11 +421,7 @@ async fn generate(
     let mut response = request.send().await.map_err(|_| "summary_model_failed")?;
     common::check(response.status().is_success(), "summary_model_rejected")?;
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| "summary_model_failed")?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| "summary_model_failed")? {
         common::check(
             bytes.len() + chunk.len() <= MAX_HTTP_BYTES,
             "summary_response_too_large",
@@ -451,19 +451,33 @@ fn plain_summary(job: &Job) -> SafeResult<String> {
         .ok_or("summary_timestamp_invalid")?
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut text = if outbound_context(job)?.is_some() {
-        format!("Outbound call transcript\nCall: {}\nStarted: {timestamp}\nOutcome: {}\n\n", job.call_sid, job.outcome)
+        format!(
+            "Outbound call transcript\nCall: {}\nStarted: {timestamp}\nOutcome: {}\n\n",
+            job.call_sid, job.outcome
+        )
     } else {
         format!(
             "Voicemail transcript — unverified caller statements\nCall: {}\nStarted: {timestamp}\nCaller ID shown (not verified): {}\n\n",
             job.call_sid,
-            if common::e164(&job.from_candidate) { job.from_candidate.as_str() } else { "unavailable" }
+            if common::e164(&job.from_candidate) {
+                job.from_candidate.as_str()
+            } else {
+                "unavailable"
+            }
         )
     };
     for entry in entries {
         let line = format!(
             "{}: {}\n",
-            match entry.speaker.as_str() { "assistant" => "AI", "owner" => "You", _ => "Them" },
-            neutralize(&entry.text).split_whitespace().collect::<Vec<_>>().join(" ")
+            match entry.speaker.as_str() {
+                "assistant" => "AI",
+                "owner" => "You",
+                _ => "Them",
+            },
+            neutralize(&entry.text)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         if text.chars().count() + line.chars().count() > 3800 {
             text.push_str("…\n");
@@ -521,7 +535,10 @@ async fn notify_summary(root: &Path, settings: &Settings, job: &Job, text: &str)
         "outcome": job.outcome,
         "text": text,
     });
-    common::check(claim(root, job, "ready", "sending")?, "summary_send_state_changed")?;
+    common::check(
+        claim(root, job, "ready", "sending")?,
+        "summary_send_state_changed",
+    )?;
     match notify::send(hook, &event).await {
         Outcome::Sent => finish(root, job, "sent", None),
         Outcome::Uncertain => finish(root, job, "uncertain", Some("notify_hook_timed_out")),
@@ -543,9 +560,17 @@ async fn tick_locked(root: &Path, client: &Client) -> SafeResult<()> {
     }
     if job.state == "queued" {
         if job.model_attempts >= MAX_MODEL_ATTEMPTS {
-            return finish(root, &job, "failed", Some("summary_model_retries_exhausted"));
+            return finish(
+                root,
+                &job,
+                "failed",
+                Some("summary_model_retries_exhausted"),
+            );
         }
-        common::check(claim(root, &job, "queued", "generating")?, "summary_claim_lost")?;
+        common::check(
+            claim(root, &job, "queued", "generating")?,
+            "summary_claim_lost",
+        )?;
         let result = match &settings.summary {
             Some(config) => generate(root, client, config, &job).await,
             None => plain_summary(&job),
@@ -664,7 +689,6 @@ fn render_summary(job: &Job, response: &str) -> SafeResult<String> {
     Ok(content)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,7 +726,11 @@ mod tests {
         let out = root.join("event.json");
         fixture::edit_config(&root, |config| {
             config.notify = Some(common::NotifyConfig {
-                command: vec!["/bin/sh".into(), "-c".into(), format!("cat > '{}'", out.display())],
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("cat > '{}'", out.display()),
+                ],
                 timeout_secs: 10,
             });
         });

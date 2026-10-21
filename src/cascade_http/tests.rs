@@ -429,6 +429,10 @@ async fn say_synthesizes_pcm() {
     config.tts = crate::common::TtsEngine::Say;
     config.tts_voice = "Fred".into();
     let pipeline = build_pipeline(&config, "").unwrap();
-    let pcm = pipeline.tts.synthesize("Hello there.".into()).await.unwrap();
+    let pcm = pipeline
+        .tts
+        .synthesize("Hello there.".into())
+        .await
+        .unwrap();
     assert!(pcm.len() > 4_800);
 }

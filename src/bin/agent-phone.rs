@@ -1,3 +1,10 @@
+use agent_phone::{
+    cascade, cascade_http, coach,
+    common::{self, RecordingConsentMode, SafeResult, Settings, VoiceEngine, check},
+    outbound,
+    protocol::{self, Form},
+    realtime, recording, summary,
+};
 use axum::{
     Router,
     body::Bytes,
@@ -10,13 +17,6 @@ use rusqlite::{OptionalExtension, params};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-};
-use agent_phone::{
-    cascade, cascade_http, coach,
-    common::{self, RecordingConsentMode, SafeResult, Settings, VoiceEngine, check},
-    outbound,
-    protocol::{self, Form},
-    realtime, recording, summary,
 };
 
 struct App {
@@ -1065,14 +1065,20 @@ fn default_root() -> PathBuf {
 }
 
 /// `--name value` pairs after the command; unknown or repeated flags are errors.
-fn flags(args: &[String], allowed: &[&str]) -> SafeResult<std::collections::HashMap<String, String>> {
+fn flags(
+    args: &[String],
+    allowed: &[&str],
+) -> SafeResult<std::collections::HashMap<String, String>> {
     let mut found = std::collections::HashMap::new();
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
         let name = flag.strip_prefix("--").ok_or("unexpected_argument")?;
         check(allowed.contains(&name), "unknown_flag")?;
         let value = rest.next().ok_or("flag_value_missing")?;
-        check(found.insert(name.to_owned(), value.clone()).is_none(), "repeated_flag")?;
+        check(
+            found.insert(name.to_owned(), value.clone()).is_none(),
+            "repeated_flag",
+        )?;
     }
     Ok(found)
 }
@@ -1129,11 +1135,17 @@ async fn run() {
     };
     // Legacy form: `agent-phone COMMAND ROOT`.
     if rest.len() == 1
-        && matches!(command.as_str(), "serve" | "mcp" | "check" | "probe" | "preflight" | "route-check")
+        && matches!(
+            command.as_str(),
+            "serve" | "mcp" | "check" | "probe" | "preflight" | "route-check"
+        )
     {
         root = PathBuf::from(&rest[0]);
     } else if !rest.is_empty()
-        && matches!(command.as_str(), "serve" | "mcp" | "check" | "probe" | "preflight" | "route-check")
+        && matches!(
+            command.as_str(),
+            "serve" | "mcp" | "check" | "probe" | "preflight" | "route-check"
+        )
     {
         eprintln!("{USAGE}");
         std::process::exit(2);
@@ -1179,7 +1191,11 @@ async fn run() {
         },
         "call" => {
             let coach = rest.iter().any(|arg| arg == "--coach");
-            let rest: Vec<String> = rest.iter().filter(|arg| *arg != "--coach").cloned().collect();
+            let rest: Vec<String> = rest
+                .iter()
+                .filter(|arg| *arg != "--coach")
+                .cloned()
+                .collect();
             match flags(&rest, &["to", "purpose", "recipient", "on-behalf-of"]) {
                 Ok(mut f) => match (f.remove("to"), f.remove("purpose")) {
                     (Some(to), Some(purpose)) => outbound::place(
@@ -1592,7 +1608,10 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             drop(bind_socket(&path).unwrap());
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             drop(bind_socket(&path).unwrap());
         });
         fs::remove_file(&path).unwrap();
@@ -1859,9 +1878,8 @@ mod tests {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, phone_router(app)).await.unwrap()
-        });
+        let server =
+            tokio::spawn(async move { axum::serve(listener, phone_router(app)).await.unwrap() });
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
@@ -2392,7 +2410,13 @@ mod tests {
 
     #[test]
     fn owner_name_is_json_encoded_into_inbound_instructions() {
-        let prompt = inbound_instructions("Take a message.".into(), "+12065550100", true, &[], Some("Ari \"<x>\""));
+        let prompt = inbound_instructions(
+            "Take a message.".into(),
+            "+12065550100",
+            true,
+            &[],
+            Some("Ari \"<x>\""),
+        );
         assert!(prompt.contains(r#"{"ownerName":"Ari \"<x>\""}"#));
         assert!(prompt.contains("immediately invoke decline_recording"));
         let none = inbound_instructions("Take a message.".into(), "", false, &[], None);

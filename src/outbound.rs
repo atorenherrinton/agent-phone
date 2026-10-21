@@ -298,7 +298,10 @@ async fn place_with_api(root: &Path, args: PlaceArgs, api_root: &str) -> SafeRes
             cfg.voice.engine == common::VoiceEngine::Cascade,
             "coach_requires_cascade_voice",
         )?;
-        let number = cfg.forwarded_from.clone().ok_or("coach_owner_number_missing")?;
+        let number = cfg
+            .forwarded_from
+            .clone()
+            .ok_or("coach_owner_number_missing")?;
         check(number != args.to, "destination_is_own_number")?;
         Some(number)
     } else {
@@ -593,13 +596,17 @@ pub fn coach_admit(root: &Path, nonce: &str, cfg: &Settings) -> SafeResult<Coach
     check(!terminal(&state), "coach_call_over")?;
     if let Some(call_sid) = call_sid {
         let phase: Option<String> = tx
-            .query_row("SELECT phase FROM calls WHERE call_sid=?1", [call_sid], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT phase FROM calls WHERE call_sid=?1",
+                [call_sid],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(|_| "call_lookup_failed")?;
         check(
-            phase.as_deref().is_none_or(|p| matches!(p, "media" | "active")),
+            phase
+                .as_deref()
+                .is_none_or(|p| matches!(p, "media" | "active")),
             "coach_call_over",
         )?;
     }
@@ -623,9 +630,8 @@ pub fn coach_admit(root: &Path, nonce: &str, cfg: &Settings) -> SafeResult<Coach
 /// End the coach leg (if any) once the AI call is over. Best effort: a leg
 /// that is still streaming has already been closed by the bridge.
 pub async fn end_coach(root: &Path, request_id: &str) {
-    let found: Option<(Option<String>, Option<String>)> = common::open_db(root)
-        .ok()
-        .and_then(|db| {
+    let found: Option<(Option<String>, Option<String>)> =
+        common::open_db(root).ok().and_then(|db| {
             initialize(&db).ok()?;
             db.query_row(
                 "SELECT coach_sid,coach_state FROM outbound_requests WHERE request_id=?1",
@@ -963,7 +969,10 @@ pub fn list_calls(root: &Path, limit: u32, direction: Option<&str>) -> SafeResul
 }
 
 pub fn get_call(root: &Path, call_sid: &str) -> SafeResult<Value> {
-    check(crate::protocol::valid_sid(call_sid, "CA"), "invalid_call_sid")?;
+    check(
+        crate::protocol::valid_sid(call_sid, "CA"),
+        "invalid_call_sid",
+    )?;
     let mut listed = {
         let db = common::open_db(root)?;
         initialize(&db)?;
@@ -1014,7 +1023,10 @@ pub async fn place(root: &Path, args: PlaceArgs) -> SafeResult<Value> {
 }
 
 pub fn status(root: &Path, request_id: &str) -> SafeResult<Value> {
-    check(uuid::Uuid::parse_str(request_id).is_ok(), "invalid_request_id")?;
+    check(
+        uuid::Uuid::parse_str(request_id).is_ok(),
+        "invalid_request_id",
+    )?;
     let db = common::open_db(root)?;
     initialize(&db)?;
     let view = load_view(&db, request_id, true)?;
@@ -1023,7 +1035,9 @@ pub fn status(root: &Path, request_id: &str) -> SafeResult<Value> {
 
 fn mcp_value(result: SafeResult<Value>) -> Value {
     match result {
-        Ok(value) => json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value}),
+        Ok(value) => {
+            json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value})
+        }
         Err(error) => mcp_error(error),
     }
 }
@@ -1296,7 +1310,11 @@ mod tests {
         });
         let args = |to: &str| PlaceArgs {
             to: to.into(),
-            on_behalf_of: if to == "+15550001005" { String::new() } else { "Owner".into() },
+            on_behalf_of: if to == "+15550001005" {
+                String::new()
+            } else {
+                "Owner".into()
+            },
             recipient: String::new(),
             purpose: "Ask about Tuesday availability".into(),
             coach: false,
@@ -1335,7 +1353,13 @@ mod tests {
         assert_eq!(first["direction"], "inbound");
         assert_eq!(first["caller_id_unverified"], "+15550000001");
         assert_eq!(first["untrusted_summary"], "Caller: Sam");
-        assert_eq!(list_calls(&root, 10, Some("outbound")).unwrap()["calls"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            list_calls(&root, 10, Some("outbound")).unwrap()["calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         assert!(list_calls(&root, 10, Some("other")).is_err());
         let call = get_call(&root, "CA11111111111111111111111111111111").unwrap();
         assert_eq!(call["untrusted_transcript"][0]["text"], "hi");

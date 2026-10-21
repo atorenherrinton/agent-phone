@@ -653,7 +653,9 @@ impl Core {
         self.total_output_bytes += mulaw.len();
         let mut effects = Vec::new();
         if self.owner_present {
-            effects.push(Effect::Owner(crate::coach::ToOwner::Assistant(mulaw.clone())));
+            effects.push(Effect::Owner(crate::coach::ToOwner::Assistant(
+                mulaw.clone(),
+            )));
         }
         for chunk in mulaw.chunks(PLAYBACK_CHUNK) {
             self.items[index].sent_bytes += chunk.len();
@@ -753,7 +755,8 @@ impl Core {
         }
         self.coach_pending = false;
         if !self.unanswered() {
-            self.history.push(json!({"role":"user","content":COACH_NUDGE}));
+            self.history
+                .push(json!({"role":"user","content":COACH_NUDGE}));
         }
         self.maybe_start_turn()
     }
@@ -778,7 +781,11 @@ impl Core {
                 Ok(Vec::new())
             }
             FromOwner::Speech(text) => {
-                let text: String = text.chars().filter(|c| !c.is_control()).take(1000).collect();
+                let text: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(1000)
+                    .collect();
                 let text = text.trim();
                 if text.is_empty() || !self.started || self.items.len() >= MAX_ITEMS {
                     return Ok(Vec::new());
@@ -788,7 +795,9 @@ impl Core {
                 self.items[index].done = true;
                 self.set_text(index, text)?;
                 if self.takeover {
-                    self.add_owner_note(format!("The owner said directly to the other party: {text}"));
+                    self.add_owner_note(format!(
+                        "The owner said directly to the other party: {text}"
+                    ));
                     Ok(Vec::new())
                 } else {
                     self.add_owner_note(format!("Coaching: {text}"));
@@ -826,7 +835,8 @@ impl Core {
         }
         self.takeover = false;
         if !self.unanswered() {
-            self.history.push(json!({"role":"user","content":HANDBACK_NUDGE}));
+            self.history
+                .push(json!({"role":"user","content":HANDBACK_NUDGE}));
         }
         self.maybe_start_turn()
     }

@@ -135,7 +135,9 @@ impl<T> Drop for Task<T> {
     }
 }
 
-async fn join_stt(task: &mut Option<Task<Result<String, StageError>>>) -> Result<String, StageError> {
+async fn join_stt(
+    task: &mut Option<Task<Result<String, StageError>>>,
+) -> Result<String, StageError> {
     match task {
         Some(handle) => {
             let result = (&mut handle.0).await.unwrap_or(Err(StageError));
@@ -167,7 +169,10 @@ fn decode_media(encoded: &str) -> BridgeResult<Vec<u8>> {
 }
 
 /// One 20 ms frame of both sides, or `None` when there is nothing to play.
-pub(crate) fn mix_frame(callee: &mut VecDeque<u8>, assistant: &mut VecDeque<u8>) -> Option<Vec<u8>> {
+pub(crate) fn mix_frame(
+    callee: &mut VecDeque<u8>,
+    assistant: &mut VecDeque<u8>,
+) -> Option<Vec<u8>> {
     if callee.is_empty() && assistant.is_empty() {
         return None;
     }

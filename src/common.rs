@@ -446,16 +446,15 @@ pub fn load(root: &Path) -> SafeResult<Settings> {
             && e164(&p.from_number)
             && p.forwarded_from.as_deref().is_none_or(e164)
             && p.caller_id.as_deref().is_none_or(e164)
-            && p
-                .allowed_destinations
+            && p.allowed_destinations
                 .as_ref()
                 .is_none_or(|list| list.len() <= 1000 && list.iter().all(|n| e164(n))),
         "invalid_phone_identity",
     )?;
     check(
-        p.owner_name
-            .as_deref()
-            .is_none_or(|name| !name.trim().is_empty() && name.len() <= 80 && !name.chars().any(char::is_control)),
+        p.owner_name.as_deref().is_none_or(|name| {
+            !name.trim().is_empty() && name.len() <= 80 && !name.chars().any(char::is_control)
+        }),
         "owner_name_invalid",
     )?;
     let auth_token =
@@ -686,9 +685,10 @@ tts_url = "http://127.0.0.1:8880/v1/audio/speech"
         assert_eq!(cascade.llm_extra["reasoning_effort"], "none");
         let bad: VoiceConfig = toml::from_str(&base.replace("Fred", "Fred; rm")).unwrap();
         assert_eq!(bad.validate(), Err("cascade_say_voice_invalid"));
-        let missing: VoiceConfig =
-            toml::from_str(&CASCADE.replace("tts_url = \"http://127.0.0.1:8880/v1/audio/speech\"", ""))
-                .unwrap();
+        let missing: VoiceConfig = toml::from_str(
+            &CASCADE.replace("tts_url = \"http://127.0.0.1:8880/v1/audio/speech\"", ""),
+        )
+        .unwrap();
         assert_eq!(missing.validate(), Err("cascade_tts_url_missing"));
     }
 
