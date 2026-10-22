@@ -32,6 +32,8 @@ const STT_TIMEOUT: Duration = Duration::from_secs(20);
 const CHAT_TIMEOUT: Duration = Duration::from_secs(40);
 const TTS_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TEXT_RESPONSE: usize = 256 * 1024;
+/// Server-sent events repeat their envelope around every token.
+const MAX_STREAM_RESPONSE: usize = 8 * MAX_TEXT_RESPONSE;
 const MAX_AUDIO_RESPONSE: usize = 6 * 1024 * 1024; // ~2 minutes of 24 kHz PCM16
 const MAX_REPLY_TOKENS: u32 = 1024;
 
@@ -245,7 +247,113 @@ pub(crate) fn parse_chat_reply(body: &[u8]) -> Result<ChatReply, StageError> {
     Ok(ChatReply { text, tool })
 }
 
+/// Accumulates an OpenAI-style streamed chat completion (server-sent events).
+#[derive(Default)]
+pub(crate) struct ChatStream {
+    text: String,
+    /// Tool calls by stream index: (type, name, arguments).
+    tools: BTreeMap<u64, (String, String, String)>,
+}
+
+impl ChatStream {
+    /// One SSE line; returns any new reply text.
+    pub(crate) fn line(&mut self, line: &str) -> Result<Option<String>, StageError> {
+        let Some(data) = line.trim_end().strip_prefix("data:") else {
+            return Ok(None);
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            return Ok(None);
+        }
+        let value: Value = serde_json::from_str(data).map_err(|_| StageError)?;
+        if !value["error"].is_null() {
+            return Err(StageError);
+        }
+        let delta = &value["choices"][0]["delta"];
+        for call in delta["tool_calls"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+        {
+            let entry = self
+                .tools
+                .entry(call["index"].as_u64().unwrap_or(0))
+                .or_default();
+            if let Some(kind) = call["type"].as_str() {
+                entry.0 = kind.to_owned();
+            }
+            entry
+                .1
+                .push_str(call["function"]["name"].as_str().unwrap_or_default());
+            entry
+                .2
+                .push_str(call["function"]["arguments"].as_str().unwrap_or_default());
+        }
+        match delta["content"].as_str() {
+            Some(text) if !text.is_empty() => {
+                self.text.push_str(text);
+                Ok(Some(text.to_owned()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The finished reply, validated exactly like a non-streamed one.
+    pub(crate) fn finish(self) -> Result<ChatReply, StageError> {
+        let calls: Vec<Value> = self
+            .tools
+            .into_values()
+            .map(|(kind, name, arguments)| {
+                json!({"type": if kind.is_empty() { "function".into() } else { kind },
+                    "function": {"name": name, "arguments": arguments}})
+            })
+            .collect();
+        let mut message = json!({"content": self.text});
+        if !calls.is_empty() {
+            message["tool_calls"] = json!(calls);
+        }
+        parse_chat_reply(
+            &serde_json::to_vec(&json!({"choices":[{"message":message}]}))
+                .map_err(|_| StageError)?,
+        )
+    }
+}
+
 impl ChatModel for HttpChat {
+    fn complete_streaming(
+        &self,
+        request: ChatRequest,
+        text: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> BoxFuture<'_, Result<ChatReply, StageError>> {
+        Box::pin(async move {
+            let mut body = chat_body(&self.model, self.openai, &self.extra, &request);
+            body["stream"] = json!(true);
+            let response = self
+                .endpoint
+                .send(|| self.endpoint.post().json(&body))
+                .await?;
+            let mut stream = response.bytes_stream();
+            let mut reply = ChatStream::default();
+            let mut pending = Vec::new();
+            let mut total = 0;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| StageError)?;
+                total += chunk.len();
+                if total > MAX_STREAM_RESPONSE {
+                    return Err(StageError);
+                }
+                pending.extend_from_slice(&chunk);
+                while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=end).collect();
+                    let line = std::str::from_utf8(&line).map_err(|_| StageError)?;
+                    if let Some(fragment) = reply.line(line)? {
+                        let _ = text.send(fragment);
+                    }
+                }
+            }
+            reply.finish()
+        })
+    }
+
     fn complete(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatReply, StageError>> {
         Box::pin(async move {
             let body = chat_body(&self.model, self.openai, &self.extra, &request);

@@ -73,6 +73,20 @@ pub trait SpeechToText: Send + Sync {
 /// `tools` array that is empty when tool calling must be off for this turn.
 pub trait ChatModel: Send + Sync {
     fn complete(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatReply, StageError>>;
+
+    /// `complete`, also sending reply text as it is generated so speech can
+    /// start before the whole reply exists. The returned reply is the same.
+    fn complete_streaming(
+        &self,
+        request: ChatRequest,
+        text: mpsc::UnboundedSender<String>,
+    ) -> BoxFuture<'_, Result<ChatReply, StageError>> {
+        Box::pin(async move {
+            let reply = self.complete(request).await?;
+            let _ = text.send(reply.text.clone());
+            Ok(reply)
+        })
+    }
 }
 
 /// Text in, 24 kHz signed 16-bit little-endian mono PCM out.
@@ -912,6 +926,22 @@ pub(crate) fn clean_speech(text: &str) -> String {
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Length of the longest prefix of growing `text` that ends a sentence of at
+/// least a phrase, judged only once the next word has started.
+fn finished_prefix(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().peekable();
+    let mut end = None;
+    while let Some((index, c)) = chars.next() {
+        if matches!(c, '.' | '!' | '?' | '\u{2026}')
+            && chars.peek().is_some_and(|(_, next)| next.is_whitespace())
+            && index + c.len_utf8() >= MIN_SENTENCE_CHARS
+        {
+            end = Some(index + c.len_utf8());
+        }
+    }
+    end
+}
+
 /// Sentence-sized chunks so the first one can be spoken while later ones are
 /// still being synthesized. Fragments shorter than a phrase join a neighbour
 /// ("Dr." + "Smith will call back.").
@@ -967,28 +997,59 @@ pub(crate) async fn run_turn(
     request: TurnRequest,
     events: mpsc::Sender<TurnEvent>,
 ) {
+    let speak = async |sentence: String| -> Result<(), StageError> {
+        let pcm = pipeline.tts.synthesize(sentence.clone()).await?;
+        let mulaw = audio::pcm24k_to_mulaw(&pcm);
+        if mulaw.is_empty() {
+            return Ok(());
+        }
+        events
+            .send(TurnEvent::Speech {
+                text: sentence,
+                mulaw,
+            })
+            .await
+            .map_err(|_| StageError)
+    };
     let outcome: Result<(String, Option<ToolCall>), StageError> = async {
-        let reply = pipeline
-            .chat
-            .complete(ChatRequest {
+        let (fragments, mut incoming) = mpsc::unbounded_channel();
+        let chat = pipeline.chat.complete_streaming(
+            ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
-            })
-            .await?;
-        let text = clean_speech(&reply.text);
-        for sentence in split_sentences(&text) {
-            let pcm = pipeline.tts.synthesize(sentence.clone()).await?;
-            let mulaw = audio::pcm24k_to_mulaw(&pcm);
-            if mulaw.is_empty() {
-                continue;
+            },
+            fragments,
+        );
+        tokio::pin!(chat);
+        // Speak each finished sentence while the model is still generating.
+        // `spoken` is a byte offset into the cleaned text so far; cleaning a
+        // longer reply only ever extends the cleaned text of a shorter one.
+        let mut raw = String::new();
+        let mut spoken = 0;
+        let mut open = true;
+        let reply = loop {
+            tokio::select! {
+                fragment = incoming.recv(), if open => {
+                    let Some(fragment) = fragment else {
+                        open = false;
+                        continue;
+                    };
+                    raw.push_str(&fragment);
+                    let text = clean_speech(&raw);
+                    let pending = text.get(spoken..).unwrap_or_default();
+                    // Text after the last finished sentence may still be growing.
+                    let Some(end) = finished_prefix(pending) else { continue };
+                    for sentence in split_sentences(&pending[..end]) {
+                        speak(sentence).await?;
+                    }
+                    spoken += end;
+                }
+                reply = &mut chat => break reply?,
             }
-            events
-                .send(TurnEvent::Speech {
-                    text: sentence,
-                    mulaw,
-                })
-                .await
-                .map_err(|_| StageError)?;
+        };
+        let text = clean_speech(&reply.text);
+        for sentence in split_sentences(text.get(spoken..).unwrap_or_default()) {
+            speak(sentence).await?;
         }
         Ok((text, reply.tool))
     }

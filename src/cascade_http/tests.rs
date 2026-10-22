@@ -436,3 +436,84 @@ async fn say_synthesizes_pcm() {
         .unwrap();
     assert!(pcm.len() > 4_800);
 }
+
+#[test]
+fn streamed_replies_accumulate_text_and_tool_calls() {
+    let mut stream = ChatStream::default();
+    let lines = [
+        r#"data: {"choices":[{"delta":{"role":"assistant","content":"Thanks, "}}]}"#,
+        "",
+        ": keep-alive",
+        r#"data: {"choices":[{"delta":{"content":"goodbye."}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"end_","arguments":""}}]}}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"call","arguments":"{}"}}]}}]}"#,
+        "data: [DONE]",
+    ];
+    let fragments: Vec<String> = lines
+        .iter()
+        .filter_map(|line| stream.line(line).unwrap())
+        .collect();
+    assert_eq!(fragments, ["Thanks, ", "goodbye."]);
+    let reply = stream.finish().unwrap();
+    assert_eq!(reply.text, "Thanks, goodbye.");
+    let tool = reply.tool.unwrap();
+    assert_eq!(
+        (tool.name.as_str(), tool.arguments.as_str()),
+        ("end_call", "{}")
+    );
+}
+
+#[test]
+fn streamed_errors_two_tools_and_dead_air_fail() {
+    let mut stream = ChatStream::default();
+    assert!(
+        stream
+            .line(r#"data: {"error":{"message":"boom"}}"#)
+            .is_err()
+    );
+    let mut stream = ChatStream::default();
+    for index in [0, 1] {
+        let line = format!(
+            r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{"index":{index},"type":"function","function":{{"name":"end_call","arguments":"{{}}"}}}}]}}}}]}}"#
+        );
+        stream.line(&line).unwrap();
+    }
+    assert!(stream.finish().is_err());
+    assert!(ChatStream::default().finish().is_err());
+}
+
+#[tokio::test]
+async fn http_chat_streams_fragments_from_the_server() {
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(|body: Bytes| async move {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["stream"], true);
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"there.\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        }),
+    );
+    let base = serve(router).await;
+    let pipeline = build_pipeline(&config(&base), "").unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let reply = pipeline
+        .chat
+        .complete_streaming(
+            ChatRequest {
+                messages: vec![json!({"role":"user","content":"hi"})],
+                tools: json!([]),
+            },
+            sender,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.text, "Hello there.");
+    let mut fragments = Vec::new();
+    while let Ok(fragment) = receiver.try_recv() {
+        fragments.push(fragment);
+    }
+    assert_eq!(fragments, ["Hello ", "there."]);
+}

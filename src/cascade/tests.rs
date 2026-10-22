@@ -1194,3 +1194,71 @@ fn opening_request_matches_the_first_live_turn() {
         assert_eq!(live.tools, expected.tools);
     }
 }
+
+/// Sends its reply in fragments and finishes only when released.
+struct GatedChat {
+    fragments: Vec<&'static str>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+impl ChatModel for GatedChat {
+    fn complete(&self, _: ChatRequest) -> BoxFuture<'_, Result<ChatReply, StageError>> {
+        Box::pin(async { Err(StageError) })
+    }
+    fn complete_streaming(
+        &self,
+        _: ChatRequest,
+        text: mpsc::UnboundedSender<String>,
+    ) -> BoxFuture<'_, Result<ChatReply, StageError>> {
+        let release = self.release.lock().unwrap().take().unwrap();
+        Box::pin(async move {
+            for fragment in &self.fragments {
+                text.send((*fragment).to_owned()).unwrap();
+            }
+            release.await.unwrap();
+            Ok(ChatReply {
+                text: self.fragments.concat(),
+                tool: None,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_finished_sentence_is_spoken_before_the_reply_completes() {
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let pipeline = Arc::new(Pipeline {
+        stt: Arc::new(FakeStt),
+        chat: Arc::new(GatedChat {
+            fragments: vec![
+                "Hi Ari, this is your",
+                " AI assistant. Is now",
+                " a good time?",
+            ],
+            release: Mutex::new(Some(gate)),
+        }),
+        tts: Arc::new(FakeTts { fail_on: None }),
+    });
+    let (sender, mut receiver) = mpsc::channel(8);
+    let request = TurnRequest {
+        messages: vec![json!({"role":"system","content":"x"})],
+        tools: json!([]),
+    };
+    tokio::spawn(run_turn(pipeline, request, sender));
+    let Some(TurnEvent::Speech { text, .. }) = receiver.recv().await else {
+        panic!("first sentence is spoken while the model is still generating");
+    };
+    assert_eq!(text, "Hi Ari, this is your AI assistant.");
+    release.send(()).unwrap();
+    let Some(TurnEvent::Speech { text, .. }) = receiver.recv().await else {
+        panic!("the rest is spoken once the reply completes");
+    };
+    assert_eq!(text, "Is now a good time?");
+    let Some(TurnEvent::Done { text, tool }) = receiver.recv().await else {
+        panic!("turn completes");
+    };
+    assert_eq!(
+        text,
+        "Hi Ari, this is your AI assistant. Is now a good time?"
+    );
+    assert!(tool.is_none());
+}
