@@ -115,6 +115,23 @@ pub struct CascadeOptions {
     pub stop_on_recording_decline: bool,
 }
 
+/// The exact request a call's opening turn sends. A local model with recurrent
+/// layers reuses only an exactly repeated prompt, so prefilling this while the
+/// phone rings removes seconds of silence after the other party says hello.
+pub fn opening_request(
+    instructions: &str,
+    allow_end_call: bool,
+    stop_on_recording_decline: bool,
+) -> ChatRequest {
+    ChatRequest {
+        messages: vec![
+            json!({"role":"system","content":instructions}),
+            json!({"role":"user","content":CONNECT_NUDGE}),
+        ],
+        tools: chat_tools(allow_end_call, stop_on_recording_decline),
+    }
+}
+
 pub(crate) fn chat_tools(allow_end_call: bool, stop_on_recording_decline: bool) -> Value {
     let mut tools = Vec::new();
     let empty = json!({"type":"object","additionalProperties":false,"properties":{}});

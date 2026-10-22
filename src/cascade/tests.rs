@@ -1178,3 +1178,19 @@ fn owner_hanging_up_during_takeover_returns_the_call_to_the_assistant() {
         0
     );
 }
+
+#[test]
+fn opening_request_matches_the_first_live_turn() {
+    for (end, decline) in [(true, false), (true, true), (false, false)] {
+        let o = CascadeOptions {
+            allow_end_call: end,
+            stop_on_recording_decline: decline,
+            ..options()
+        };
+        let (_, effects) = started(&o);
+        let live = turn_request(&effects).unwrap();
+        let expected = opening_request(&o.instructions, end, decline);
+        assert_eq!(live.messages, expected.messages);
+        assert_eq!(live.tools, expected.tools);
+    }
+}

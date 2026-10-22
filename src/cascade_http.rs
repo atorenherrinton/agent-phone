@@ -396,21 +396,26 @@ pub fn build_pipeline(config: &CascadeConfig, api_key: &str) -> SafeResult<Pipel
 /// Best-effort request that makes a local model server load the chat model
 /// before the first turn (Ollama otherwise pays a multi-second cold start).
 pub async fn warm(config: &CascadeConfig) {
+    prefill(
+        config,
+        &ChatRequest {
+            messages: vec![json!({"role":"user","content":"ok"})],
+            tools: json!([]),
+        },
+    )
+    .await
+}
+
+/// Process `request`'s prompt on a local model without speaking, so the same
+/// request later starts from the server's prompt cache.
+pub async fn prefill(config: &CascadeConfig, request: &ChatRequest) {
     let Ok(endpoint) = Endpoint::new(&config.llm_url, "", CHAT_TIMEOUT) else {
         return;
     };
     if openai_host(&endpoint.url) {
         return;
     }
-    let mut body = chat_body(
-        &config.llm_model,
-        false,
-        &config.llm_extra,
-        &ChatRequest {
-            messages: vec![json!({"role":"user","content":"ok"})],
-            tools: json!([]),
-        },
-    );
+    let mut body = chat_body(&config.llm_model, false, &config.llm_extra, request);
     body["max_tokens"] = json!(1);
     let _ = endpoint.post().json(&body).send().await;
 }

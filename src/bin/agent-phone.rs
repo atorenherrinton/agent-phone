@@ -467,13 +467,26 @@ async fn outbound_status(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
-    let result = (|| -> SafeResult<()> {
+    let result = (|| -> SafeResult<(Settings, Form)> {
         let cfg = common::load(&app.root)?;
         let form = authenticate(&cfg, &uri, &headers, &bytes)?;
-        outbound::update_status(&app.root, &nonce, &cfg, &form)
+        outbound::update_status(&app.root, &nonce, &cfg, &form)?;
+        Ok((cfg, form))
     })();
-    if let Err(code) = result {
-        return reject("outbound_status", code);
+    let (cfg, form) = match result {
+        Ok(value) => value,
+        Err(code) => return reject("outbound_status", code),
+    };
+    // Process the opening prompt while the phone rings, so a person who
+    // answers is not left waiting on a cold local model.
+    if form.get("CallStatus").is_some_and(|v| v == "ringing")
+        && cfg.voice.engine == VoiceEngine::Cascade
+        && let Some(cascade) = cfg.voice.cascade
+        && let Some(sid) = form.get("CallSid")
+        && let Ok(Some(task)) = outbound::ringing_task(&app.root, sid)
+    {
+        let request = cascade::opening_request(&outbound::instructions(&task), true, false);
+        tokio::spawn(async move { cascade_http::prefill(&cascade, &request).await });
     }
     // An unanswered or finished AI call must not leave the owner's phone
     // ringing or connected to nothing.
