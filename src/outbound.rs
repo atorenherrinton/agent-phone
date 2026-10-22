@@ -876,12 +876,14 @@ pub fn session_task(root: &Path, call_sid: &str) -> SafeResult<Option<SessionTas
 }
 
 /// The task a ringing call will run if a person answers, for prompt prefill.
-pub fn ringing_task(root: &Path, call_sid: &str) -> SafeResult<Option<SessionTask>> {
+/// Looked up by the status-callback nonce: Twilio can report ringing before
+/// the placing process has stored the call SID.
+pub fn ringing_task(root: &Path, nonce: &str) -> SafeResult<Option<SessionTask>> {
     let db = common::open_db(root)?;
     initialize(&db)?;
     db.query_row(
-        "SELECT on_behalf_of,recipient,purpose,request_id,coach_nonce FROM outbound_requests WHERE call_sid=?1 AND answered_by IS NULL",
-        [call_sid],
+        "SELECT on_behalf_of,recipient,purpose,request_id,coach_nonce FROM outbound_requests WHERE nonce=?1 AND answered_by IS NULL",
+        [nonce],
         |r| {
             Ok(SessionTask {
                 on_behalf_of: r.get(0)?,

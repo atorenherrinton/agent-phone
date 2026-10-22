@@ -482,8 +482,7 @@ async fn outbound_status(
     if form.get("CallStatus").is_some_and(|v| v == "ringing")
         && cfg.voice.engine == VoiceEngine::Cascade
         && let Some(cascade) = cfg.voice.cascade
-        && let Some(sid) = form.get("CallSid")
-        && let Ok(Some(task)) = outbound::ringing_task(&app.root, sid)
+        && let Ok(Some(task)) = outbound::ringing_task(&app.root, &nonce)
     {
         let request = cascade::opening_request(&outbound::instructions(&task), true, false);
         tokio::spawn(async move { cascade_http::prefill(&cascade, &request).await });
@@ -1483,6 +1482,9 @@ mod tests {
 
         let path = format!("/voice/outbound/{nonce}");
         let mut answer_form = outbound_form("in-progress");
+        let ringing = outbound::ringing_task(&fixture.root, &nonce)
+            .unwrap()
+            .unwrap();
         answer_form.insert("AnsweredBy".into(), "human".into());
         let answer_request = signed(&path, &answer_form);
         let cfg = common::load(&fixture.root).unwrap();
@@ -1509,6 +1511,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(task.recipient, "Example shop");
+        // The prompt prefilled while ringing is exactly the answered call's.
+        assert_eq!(
+            outbound::instructions(&ringing),
+            outbound::instructions(&task)
+        );
+        assert!(
+            outbound::ringing_task(&fixture.root, &nonce)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(task.answer_kind, "human");
 
         let status_path = format!("/voice/outbound-status/{nonce}");
