@@ -45,6 +45,7 @@ const MAX_MEDIA_PAYLOAD: usize = 8 * 1024;
 /// Utterances waiting on a busy recognizer before the call fails closed.
 const MAX_PENDING_UTTERANCES: usize = 4;
 const MAX_STT_FAILURES: u8 = 3;
+const MAX_TURN_FAILURES: u8 = 2;
 const MAX_SENTENCE_CHARS: usize = 400;
 const MIN_SENTENCE_CHARS: usize = 20;
 const DRAIN_GRACE: Duration = Duration::from_millis(2500);
@@ -256,6 +257,7 @@ pub(crate) struct Core {
     stt_inflight: bool,
     stt_queue: VecDeque<Vec<u8>>,
     stt_failures: u8,
+    turn_failures: u8,
     turn: Option<ActiveTurn>,
     items: Vec<Utterance>,
     marks: BTreeMap<String, PlaybackMark>,
@@ -304,6 +306,7 @@ impl Core {
             stt_inflight: false,
             stt_queue: VecDeque::new(),
             stt_failures: 0,
+            turn_failures: 0,
             turn: None,
             items: Vec::new(),
             marks: BTreeMap::new(),
@@ -672,8 +675,27 @@ impl Core {
         match event {
             TurnEvent::Speech { text, mulaw } => self.speech(text, mulaw),
             TurnEvent::Done { text, tool } => self.done(text, tool),
-            TurnEvent::Failed => Err(EndReason::UpstreamError),
+            TurnEvent::Failed => self.failed(),
         }
+    }
+
+    /// A failed reply (a timeout, an unparsable tool call, an empty answer)
+    /// is retried once; only repeated failures end the call.
+    fn failed(&mut self) -> BridgeResult<Vec<Effect>> {
+        let active = self.turn.take().ok_or(EndReason::ProtocolError)?;
+        self.items[active.item_index].done = true;
+        self.turn_failures += 1;
+        if self.turn_failures >= MAX_TURN_FAILURES {
+            return Err(EndReason::UpstreamError);
+        }
+        if active.confirmation {
+            self.close_phase = ClosePhase::Open;
+        }
+        self.maybe_start_turn()
+    }
+
+    fn caller_has_spoken(&self) -> bool {
+        self.items.iter().any(|item| item.speaker == "caller")
     }
 
     fn speech(&mut self, text: String, mulaw: Vec<u8>) -> BridgeResult<Vec<Effect>> {
@@ -731,6 +753,7 @@ impl Core {
         let active = self.turn.take().ok_or(EndReason::ProtocolError)?;
         let index = active.item_index;
         self.items[index].done = true;
+        self.turn_failures = 0;
         if !text.is_empty() {
             self.set_text(index, &text)?;
             self.history
@@ -766,6 +789,9 @@ impl Core {
             match tool {
                 // A refusal must not wait for playback or a close check.
                 CallTool::DeclineRecording => return Err(EndReason::RecordingDeclined),
+                // Local models call end_call alongside a question, or before the
+                // other party has said a word; hanging up then cuts the call off.
+                CallTool::EndCall if !self.caller_has_spoken() || text.contains('?') => {}
                 CallTool::EndCall
                     if self.confirm_end_call && self.close_phase != ClosePhase::Ready =>
                 {
@@ -927,9 +953,22 @@ impl Core {
 
 /// Strip markup a model may emit that a speech engine would read aloud.
 pub(crate) fn clean_speech(text: &str) -> String {
+    // Bracketed stage directions ("[Call connecting]") are never spoken; an
+    // unclosed one hides the rest, so a growing reply still only ever extends.
+    let mut depth = 0usize;
     let stripped: String = text
         .chars()
-        .filter(|c| !matches!(c, '*' | '_' | '#' | '`' | '~'))
+        .filter(|c| match c {
+            '[' => {
+                depth += 1;
+                false
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                false
+            }
+            _ => depth == 0 && !matches!(c, '*' | '_' | '#' | '`' | '~'),
+        })
         .collect();
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }

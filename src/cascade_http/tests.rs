@@ -154,7 +154,7 @@ fn chat_replies_are_parsed_strictly() {
         br#"{"choices":[{"message":{"content":"  "}}]}"#,
         br#"{"choices":[{"message":{"content":"x","tool_calls":[
             {"type":"function","function":{"name":"end_call","arguments":"{}"}},
-            {"type":"function","function":{"name":"end_call","arguments":"{}"}}]}}]}"#,
+            {"type":"function","function":{"name":"decline_recording","arguments":"{}"}}]}}]}"#,
         br#"{"choices":[{"message":{"content":"x","tool_calls":[{"type":"other"}]}}]}"#,
         b"not json",
     ] {
@@ -472,13 +472,25 @@ fn streamed_errors_two_tools_and_dead_air_fail() {
             .is_err()
     );
     let mut stream = ChatStream::default();
+    for (index, name) in [(0, "end_call"), (1, "decline_recording")] {
+        let line = format!(
+            r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{"index":{index},"type":"function","function":{{"name":"{name}","arguments":"{{}}"}}}}]}}}}]}}"#
+        );
+        stream.line(&line).unwrap();
+    }
+    assert!(stream.finish().is_err());
+    let mut stream = ChatStream::default();
     for index in [0, 1] {
         let line = format!(
             r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{"index":{index},"type":"function","function":{{"name":"end_call","arguments":"{{}}"}}}}]}}}}]}}"#
         );
         stream.line(&line).unwrap();
     }
-    assert!(stream.finish().is_err());
+    assert_eq!(
+        stream.finish().unwrap().tool.unwrap().name,
+        "end_call",
+        "a repeated call is one request"
+    );
     assert!(ChatStream::default().finish().is_err());
 }
 

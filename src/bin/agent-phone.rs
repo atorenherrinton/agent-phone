@@ -479,10 +479,11 @@ async fn outbound_status(
     };
     // Process the opening prompt while the phone rings, so a person who
     // answers is not left waiting on a cold local model.
+    let owner_numbers = cfg.owner_numbers();
     if form.get("CallStatus").is_some_and(|v| v == "ringing")
         && cfg.voice.engine == VoiceEngine::Cascade
         && let Some(cascade) = cfg.voice.cascade
-        && let Ok(Some(task)) = outbound::ringing_task(&app.root, &nonce)
+        && let Ok(Some(task)) = outbound::ringing_task(&app.root, &nonce, &owner_numbers)
     {
         let request = cascade::opening_request(&outbound::instructions(&task), true, false);
         tokio::spawn(async move { cascade_http::prefill(&cascade, &request).await });
@@ -639,7 +640,7 @@ async fn media(
     let Ok((cfg, sid, from, consented, first_entries, remaining, permit)) = result else {
         return fail();
     };
-    let outbound_task = match outbound::session_task(&app.root, &sid) {
+    let outbound_task = match outbound::session_task(&app.root, &sid, &cfg.owner_numbers()) {
         Ok(task) => task,
         Err(_) => {
             if let Ok(db) = common::open_db(&app.root) {
@@ -1483,7 +1484,7 @@ mod tests {
 
         let path = format!("/voice/outbound/{nonce}");
         let mut answer_form = outbound_form("in-progress");
-        let ringing = outbound::ringing_task(&fixture.root, &nonce)
+        let ringing = outbound::ringing_task(&fixture.root, &nonce, &[])
             .unwrap()
             .unwrap();
         answer_form.insert("AnsweredBy".into(), "human".into());
@@ -1508,7 +1509,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("media".into(), "pending".into()));
-        let task = outbound::session_task(&fixture.root, SECOND_CALL)
+        let task = outbound::session_task(&fixture.root, SECOND_CALL, &[])
             .unwrap()
             .unwrap();
         assert_eq!(task.recipient, "Example shop");
@@ -1518,7 +1519,7 @@ mod tests {
             outbound::instructions(&task)
         );
         assert!(
-            outbound::ringing_task(&fixture.root, &nonce)
+            outbound::ringing_task(&fixture.root, &nonce, &[])
                 .unwrap()
                 .is_none()
         );

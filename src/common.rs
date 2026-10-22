@@ -370,6 +370,17 @@ pub struct Settings {
     pub voice: VoiceConfig,
 }
 
+impl Settings {
+    /// The owner's own phones: calls to them skip the third-party disclosure.
+    pub fn owner_numbers(&self) -> Vec<String> {
+        self.forwarded_from
+            .iter()
+            .chain([&self.caller_id])
+            .cloned()
+            .collect()
+    }
+}
+
 fn valid_secret_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
