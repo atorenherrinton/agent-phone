@@ -316,13 +316,15 @@ fn caller_speech_is_answered_once_it_stops_and_merges_while_unanswered() {
 }
 
 #[test]
-fn the_connect_nudge_is_replaced_when_the_caller_speaks_first() {
+fn a_caller_who_speaks_first_follows_the_unheard_opener() {
     let o = options();
     let (mut core, _) = started(&o);
     let effects = say(&mut core, "hello?");
     let request = turn_request(&effects).unwrap();
-    assert_eq!(request.messages.len(), 2);
-    assert_eq!(request.messages[1]["content"], "hello?");
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(request.messages[1]["content"], CONNECT_NUDGE);
+    assert_eq!(request.messages[2]["content"], UNHEARD_MARKER);
+    assert_eq!(request.messages[3]["content"], "hello?");
 }
 
 #[test]
@@ -1261,4 +1263,17 @@ async fn a_finished_sentence_is_spoken_before_the_reply_completes() {
         "Hi Ari, this is your AI assistant. Is now a good time?"
     );
     assert!(tool.is_none());
+}
+
+#[test]
+fn an_opener_interrupted_before_any_audio_keeps_the_prompt_prefix() {
+    let o = options();
+    let (mut core, effects) = started(&o);
+    let opening = turn_request(&effects).unwrap().messages.clone();
+    let effects = say(&mut core, "Hello?");
+    let next = turn_request(&effects).expect("the caller's words start a turn");
+    assert_eq!(next.messages[..opening.len()], opening[..]);
+    assert_eq!(next.messages[opening.len()]["role"], "assistant");
+    assert_eq!(next.messages[opening.len()]["content"], UNHEARD_MARKER);
+    assert_eq!(next.messages[opening.len() + 1]["content"], "Hello?");
 }

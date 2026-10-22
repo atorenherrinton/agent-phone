@@ -424,9 +424,17 @@ impl Core {
         self.items[index].done = true;
         self.set_text(index, text)?;
         match self.history.last_mut() {
+            // The opener was cut off before any of it played. Keep the nudge and
+            // record the unheard turn rather than rewriting the opening prompt:
+            // a local model reuses only a prompt that extends one it processed.
+            Some(last) if last["role"] == "user" && last["content"] == CONNECT_NUDGE => {
+                self.history
+                    .push(json!({"role":"assistant","content":UNHEARD_MARKER}));
+                self.history.push(json!({"role":"user","content":text}));
+            }
             Some(last)
                 if last["role"] == "user"
-                    && [CONNECT_NUDGE, COACH_NUDGE, HANDBACK_NUDGE]
+                    && [COACH_NUDGE, HANDBACK_NUDGE]
                         .contains(&last["content"].as_str().unwrap_or_default()) =>
             {
                 last["content"] = json!(text);
