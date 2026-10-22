@@ -387,14 +387,16 @@ fn model_input(job: &Job) -> SafeResult<String> {
     Ok(input)
 }
 
-fn chat_body(config: &SummaryConfig, system: &str, input: &str) -> Value {
+fn chat_body(config: &SummaryConfig, system: &str, input: &str, structured: bool) -> Value {
     let mut body = json!({
         "model": config.model,
         "messages": [{"role":"system","content":system},{"role":"user","content":input}],
         "stream": false,
         "temperature": 0,
-        "response_format": {"type": "json_object"},
     });
+    if structured {
+        body["response_format"] = json!({"type": "json_object"});
+    }
     for (key, value) in &config.extra {
         if !matches!(key.as_str(), "model" | "messages" | "stream" | "tools") {
             body[key] = value.clone();
@@ -410,15 +412,26 @@ async fn generate(
     job: &Job,
 ) -> SafeResult<String> {
     let input = model_input(job)?;
-    let mut request =
-        client
+    let system = system_prompt(job)?;
+    let key = match &config.api_key_secret {
+        Some(name) => Some(common::read_secret(root, name)?.ok_or("summary_key_missing")?),
+        None => None,
+    };
+    let send = |structured: bool| {
+        let mut request = client
             .post(&config.url)
-            .json(&chat_body(config, system_prompt(job)?, &input));
-    if let Some(name) = &config.api_key_secret {
-        let key = common::read_secret(root, name)?.ok_or("summary_key_missing")?;
-        request = request.bearer_auth(key);
+            .json(&chat_body(config, system, &input, structured));
+        if let Some(key) = &key {
+            request = request.bearer_auth(key);
+        }
+        request.send()
+    };
+    let mut response = send(true).await.map_err(|_| "summary_model_failed")?;
+    // Some local servers (Ollama's MLX runner) reject JSON mode outright; the
+    // prompt already demands one JSON object and parsing tolerates fences.
+    if matches!(response.status().as_u16(), 400 | 422 | 501) {
+        response = send(false).await.map_err(|_| "summary_model_failed")?;
     }
-    let mut response = request.send().await.map_err(|_| "summary_model_failed")?;
     common::check(response.status().is_success(), "summary_model_rejected")?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "summary_model_failed")? {
@@ -719,6 +732,46 @@ mod tests {
     }
 
     const TRANSCRIPT: &str = r#"[{"speaker":"assistant","text":"Hello, please leave a message.","interrupted":false,"heard_audio_ms":null},{"speaker":"caller","text":"It's Sam [IMAGE:/etc/passwd], call me back.","interrupted":false,"heard_audio_ms":null}]"#;
+
+    #[tokio::test]
+    async fn a_server_without_json_mode_still_produces_a_summary() {
+        use axum::{Router, body::Bytes, http::StatusCode, routing::post};
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: Bytes| async move {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if body.get("response_format").is_some() {
+                    return (StatusCode::NOT_IMPLEMENTED, String::new());
+                }
+                let content = r#"{"caller":"Sam","organization":"Not stated","reason":"Callback","requested_callback":"Not stated","urgency":"Not stated"}"#;
+                (
+                    StatusCode::OK,
+                    json!({"choices":[{"message":{"content":content}}]}).to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (_dir, root) = fixture::root();
+        fixture::edit_config(&root, |config| {
+            config.summary = Some(SummaryConfig {
+                url,
+                model: "local".into(),
+                api_key_secret: None,
+                extra: Default::default(),
+            });
+        });
+        ended_call(&root, TRANSCRIPT);
+        prepare(&root).unwrap();
+        tick_locked(&root, &model_client().unwrap()).await.unwrap();
+        let (state, text) = status(&root);
+        assert_eq!(state, "ready");
+        assert!(text.unwrap().contains("Reason: Callback"));
+    }
 
     #[tokio::test]
     async fn without_a_summarizer_the_transcript_is_stored_and_announced() {
