@@ -37,6 +37,15 @@ fn started(o: &CascadeOptions) -> (Core, Vec<Effect>) {
     (core, effects)
 }
 
+/// Past the opener: the caller has spoken and a reply turn is in flight.
+fn conversing(o: &CascadeOptions) -> Core {
+    let (mut core, _) = started(o);
+    core.turn_event(done("Hello.", None)).unwrap();
+    let effects = say(&mut core, "Hi, who is this?");
+    assert!(turn_request(&effects).is_some());
+    core
+}
+
 fn media(core: &mut Core, mulaw: &[u8]) -> BridgeResult<Vec<Effect>> {
     core.twilio(json!({
         "event":"media","streamSid":stream_sid(),
@@ -417,7 +426,7 @@ fn recognition_backlog_and_repeated_failures_fail_closed() {
 #[test]
 fn one_step_end_call_waits_for_every_playback_mark() {
     let o = options();
-    let (mut core, _) = started(&o);
+    let mut core = conversing(&o);
     let audio = core
         .turn_event(speech("Thank you, goodbye.", 1_000))
         .unwrap();
@@ -429,7 +438,7 @@ fn one_step_end_call_waits_for_every_playback_mark() {
         Some(EndReason::AssistantEnded)
     );
 
-    let (mut core, _) = started(&o);
+    let mut core = conversing(&o);
     assert_eq!(
         core.turn_event(done("", Some("end_call"))).err(),
         Some(EndReason::AssistantEnded),
@@ -441,7 +450,7 @@ fn one_step_end_call_waits_for_every_playback_mark() {
 fn interactive_end_call_runs_a_tool_free_confirmation_before_closing() {
     let mut o = options();
     o.confirm_end_call = true;
-    let (mut core, _) = started(&o);
+    let mut core = conversing(&o);
     let effects = core.turn_event(done("All set.", Some("end_call"))).unwrap();
     let request = turn_request(&effects).expect("confirmation turn");
     assert!(request.tools.as_array().unwrap().is_empty());
@@ -483,7 +492,7 @@ fn interactive_end_call_runs_a_tool_free_confirmation_before_closing() {
 fn an_inaudible_confirmation_reopens_the_call_and_the_next_request_asks_again() {
     let mut o = options();
     o.confirm_end_call = true;
-    let (mut core, _) = started(&o);
+    let mut core = conversing(&o);
     core.turn_event(done("", Some("end_call"))).unwrap();
     // The prompt was never audible, so it cannot count as the confirmation.
     core.turn_event(done("", None)).unwrap();
@@ -501,7 +510,7 @@ fn an_inaudible_confirmation_reopens_the_call_and_the_next_request_asks_again() 
 fn the_confirmation_turn_cannot_close_the_call_itself() {
     let mut o = options();
     o.confirm_end_call = true;
-    let (mut core, _) = started(&o);
+    let mut core = conversing(&o);
     core.turn_event(done("", Some("end_call"))).unwrap();
     core.turn_event(speech("Anything else?", 800)).unwrap();
     assert!(
@@ -514,7 +523,7 @@ fn the_confirmation_turn_cannot_close_the_call_itself() {
 #[test]
 fn caller_speech_over_a_goodbye_keeps_the_call_open() {
     let o = options();
-    let (mut core, _) = started(&o);
+    let mut core = conversing(&o);
     core.turn_event(speech("Goodbye.", 800)).unwrap();
     core.turn_event(done("Goodbye.", Some("end_call"))).unwrap();
     let effects = media(&mut core, &test_tone(12, 6_000.0)).unwrap();
@@ -608,6 +617,11 @@ fn ceilings_and_stage_failures_fail_closed() {
         Some(EndReason::ResourceLimit)
     );
     let (mut core, _) = started(&o);
+    let retry = core.turn_event(TurnEvent::Failed).unwrap();
+    assert!(
+        turn_request(&retry).is_some(),
+        "one failed reply is retried"
+    );
     assert_eq!(
         core.turn_event(TurnEvent::Failed).err(),
         Some(EndReason::UpstreamError)
@@ -1276,4 +1290,47 @@ fn an_opener_interrupted_before_any_audio_keeps_the_prompt_prefix() {
     assert_eq!(next.messages[opening.len()]["role"], "assistant");
     assert_eq!(next.messages[opening.len()]["content"], UNHEARD_MARKER);
     assert_eq!(next.messages[opening.len() + 1]["content"], "Hello?");
+}
+
+#[test]
+fn end_call_is_ignored_before_the_caller_speaks_or_alongside_a_question() {
+    let o = options();
+    let (mut core, _) = started(&o);
+    assert!(
+        core.turn_event(done("Hi, this is an AI assistant.", Some("end_call")))
+            .is_ok(),
+        "the opener cannot hang up"
+    );
+    let effects = say(&mut core, "Hello?");
+    assert!(turn_request(&effects).is_some());
+    assert!(
+        core.turn_event(done("Is it okay to continue?", Some("end_call")))
+            .is_ok(),
+        "a reply that asks something waits for the answer"
+    );
+    say(&mut core, "Sure.");
+    assert_eq!(
+        core.turn_event(done("", Some("end_call"))).err(),
+        Some(EndReason::AssistantEnded)
+    );
+}
+
+#[test]
+fn a_successful_reply_resets_the_failure_count() {
+    let o = options();
+    let (mut core, _) = started(&o);
+    core.turn_event(TurnEvent::Failed).unwrap();
+    core.turn_event(done("Hello.", None)).unwrap();
+    say(&mut core, "Hi.");
+    let retry = core.turn_event(TurnEvent::Failed).unwrap();
+    assert!(turn_request(&retry).is_some());
+}
+
+#[test]
+fn bracketed_stage_directions_are_not_spoken() {
+    assert_eq!(
+        clean_speech("[Call connecting] Hello, Bond here."),
+        "Hello, Bond here."
+    );
+    assert_eq!(clean_speech("Hello. [aside"), "Hello.");
 }

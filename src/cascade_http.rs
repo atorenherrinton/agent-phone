@@ -217,8 +217,12 @@ pub(crate) fn parse_chat_reply(body: &[u8]) -> Result<ChatReply, StageError> {
     let calls = message["tool_calls"]
         .as_array()
         .map_or(&[][..], Vec::as_slice);
-    // One fixed tool per turn, as with Realtime: anything else is a protocol fault.
-    if calls.len() > 1 {
+    // One fixed tool per turn, as with Realtime: anything else is a protocol
+    // fault. A model that repeats the same call has still made one request.
+    if calls
+        .iter()
+        .any(|call| call["function"]["name"] != calls[0]["function"]["name"])
+    {
         return Err(StageError);
     }
     let tool = match calls.first() {
