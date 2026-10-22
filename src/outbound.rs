@@ -267,10 +267,22 @@ fn parse_created(
     check(
         value["account_sid"] == cfg.account_sid
             && value["to"] == args.to
-            && value["from"] == cfg.caller_id,
+            && value["from"] == calling_number(cfg, &args.to),
         "outbound_response_identity_mismatch",
     )?;
     Ok((sid.to_owned(), normalize_status(status)?))
+}
+
+/// The number an AI call shows. A call to the owner's own cell can't come from
+/// that cell (carriers send a call from yourself straight to voicemail), so it
+/// comes from the Twilio number; if it rolls to voicemail anyway, the
+/// forwarded-back leg is rejected as a loop.
+fn calling_number<'a>(cfg: &'a Settings, to: &str) -> &'a str {
+    if to == cfg.caller_id {
+        &cfg.from_number
+    } else {
+        &cfg.caller_id
+    }
 }
 
 async fn place_with_api(root: &Path, args: PlaceArgs, api_root: &str) -> SafeResult<RequestView> {
@@ -287,10 +299,7 @@ async fn place_with_api(root: &Path, args: PlaceArgs, api_root: &str) -> SafeRes
             .is_none_or(|list| list.contains(&args.to)),
         "destination_not_allowed",
     )?;
-    check(
-        args.to != cfg.from_number && args.to != cfg.caller_id,
-        "destination_is_own_number",
-    )?;
+    check(args.to != cfg.from_number, "destination_is_own_number")?;
     // The coach leg only ever rings the owner's configured number, never one
     // an agent supplies.
     let coach_number = if args.coach {
@@ -381,7 +390,7 @@ async fn place_with_api(root: &Path, args: PlaceArgs, api_root: &str) -> SafeRes
     let status_url = format!("{}/voice/outbound-status/{nonce}", cfg.public_base);
     let form = vec![
         ("To", args.to.as_str()),
-        ("From", cfg.caller_id.as_str()),
+        ("From", calling_number(&cfg, &args.to)),
         ("Url", answer_url.as_str()),
         ("Method", "POST"),
         ("StatusCallback", status_url.as_str()),
@@ -697,12 +706,12 @@ fn bind_call(
         crate::protocol::one(form, "Direction")? == "outbound-api",
         "wrong_direction",
     )?;
+    let to = crate::protocol::one(form, "To")?;
     check(
-        crate::protocol::one(form, "From")? == cfg.caller_id,
+        crate::protocol::one(form, "From")? == calling_number(cfg, to),
         "wrong_calling_number",
     )?;
     let sid = crate::protocol::one(form, "CallSid")?;
-    let to = crate::protocol::one(form, "To")?;
     let answered_by = crate::protocol::one(form, "AnsweredBy")?;
     let answer_kind = match answered_by {
         "human" => Some("interactive"),
@@ -799,12 +808,12 @@ pub fn update_status(
         crate::protocol::one(form, "Direction")? == "outbound-api",
         "wrong_direction",
     )?;
+    let to = crate::protocol::one(form, "To")?;
     check(
-        crate::protocol::one(form, "From")? == cfg.caller_id,
+        crate::protocol::one(form, "From")? == calling_number(cfg, to),
         "wrong_calling_number",
     )?;
     let sid = crate::protocol::one(form, "CallSid")?;
-    let to = crate::protocol::one(form, "To")?;
     let state = normalize_status(crate::protocol::one(form, "CallStatus")?)?;
     let mut db = common::open_db(root)?;
     initialize(&db)?;
@@ -1328,6 +1337,17 @@ mod tests {
         fixture::edit_config(&root, |config| config.allowed_destinations = None);
         assert!(matches!(
             place_with_api(&root, args("+15550001001"), api).await,
+            Err("destination_is_own_number")
+        ));
+        // The owner's cell as caller ID is still callable, from the Twilio number.
+        fixture::edit_config(&root, |config| {
+            config.caller_id = Some("+15550001007".into())
+        });
+        let cfg = common::load(&root).unwrap();
+        assert_eq!(calling_number(&cfg, "+15550001007"), "+15550001001");
+        assert_eq!(calling_number(&cfg, "+15550001002"), "+15550001007");
+        assert!(!matches!(
+            place_with_api(&root, args("+15550001007"), api).await,
             Err("destination_is_own_number")
         ));
         // No owner name configured and none supplied: the disclosure would be empty.
