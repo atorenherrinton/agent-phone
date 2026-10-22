@@ -44,6 +44,8 @@ agent writes into `purpose` may be spoken**.
 cargo build --release
 rm -f ~/.local/bin/agent-phone && cp target/release/agent-phone ~/.local/bin/
 codesign -f -s - ~/.local/bin/agent-phone   # macOS: a reinstalled linker-signed binary can fail launchd's signature check
+# Upgrading a running LaunchAgent: `launchctl bootout` it before replacing the binary and
+# `launchctl bootstrap` it after; swapping it under a running job can fail to relaunch.
 mkdir -p ~/.agent-phone && chmod 700 ~/.agent-phone
 cp examples/phone.toml examples/screening.md ~/.agent-phone/ && chmod 600 ~/.agent-phone/*
 printf %s "$TWILIO_AUTH_TOKEN" | agent-phone set-secret twilio_auth_token
