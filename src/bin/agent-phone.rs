@@ -206,8 +206,11 @@ fn initial(root: &Path, uri: &Uri, headers: &HeaderMap, bytes: &[u8]) -> SafeRes
         .unwrap_or_default();
     // An outbound call to the owner that rolls to voicemail is forwarded back
     // here; answering it would make the phone call itself and file a phantom
-    // voicemail, so the loop is turned away before any call state exists.
-    if from == cfg.from_number {
+    // voicemail, so the loop is turned away before any call state exists. With
+    // the owner's cell as caller ID, the loop shows up as a forwarded call from
+    // that cell; a direct call from it is not forwarded and is still answered.
+    let forwarded = form.get("ForwardedFrom").is_some_and(|v| !v.is_empty());
+    if from == cfg.from_number || (forwarded && from == cfg.caller_id) {
         return Ok(protocol::REJECT.into());
     }
     tx.execute(
@@ -1596,6 +1599,23 @@ mod tests {
             .unwrap();
         assert_eq!(state, ("consent".into(), None, None));
         assert_eq!(fixture.recording_count(), 0);
+    }
+
+    #[test]
+    fn forwarded_call_from_own_caller_id_is_rejected_but_direct_call_is_not() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("phone.toml");
+        let mut config: common::PhoneConfig =
+            toml::from_str(&common::private_read(&path).unwrap()).unwrap();
+        config.caller_id = Some(FORWARDED.into());
+        common::atomic_private_write(&path, toml::to_string(&config).unwrap().as_bytes()).unwrap();
+        let mut form = valid_form();
+        form.insert("From".into(), FORWARDED.into());
+        assert_eq!(fixture.initial(&form).unwrap(), protocol::REJECT);
+        assert_eq!(fixture.count(), 0);
+        form.remove("ForwardedFrom");
+        assert_ne!(fixture.initial(&form).unwrap(), protocol::REJECT);
+        assert_eq!(fixture.count(), 1);
     }
 
     #[test]
