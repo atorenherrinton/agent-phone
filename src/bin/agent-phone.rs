@@ -790,6 +790,7 @@ fn inbound_instructions(
     } else {
         "\nIf the caller objects to transcription, immediately invoke end_call before any further speech. Do not persuade them to continue.\n"
     });
+    instructions.push_str("\nThis is a live phone call: keep each reply to one or two short sentences, and ask one thing at a time.\n");
     instructions.push_str("\nOnce their message is complete, give a short acknowledgment and goodbye, then call end_call. It only ends this call. Never speak function names aloud.\n");
     if let Some(first) = first_entries.first() {
         let caller_text = serde_json::json!({"speaker":"caller","text":first.text});
